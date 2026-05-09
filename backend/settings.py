@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -44,6 +45,11 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'crm',
 ]
+
+USE_SUPABASE_STORAGE = os.getenv('USE_SUPABASE_STORAGE', 'false').lower() == 'true'
+
+if USE_SUPABASE_STORAGE:
+    INSTALLED_APPS.append('storages')
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -138,6 +144,58 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+if USE_SUPABASE_STORAGE:
+    SUPABASE_STORAGE_BUCKET = os.getenv('SUPABASE_STORAGE_BUCKET', '').strip()
+    SUPABASE_STORAGE_ENDPOINT_URL = os.getenv('SUPABASE_STORAGE_ENDPOINT_URL', '').strip()
+    SUPABASE_STORAGE_REGION = os.getenv('SUPABASE_STORAGE_REGION', '').strip()
+    SUPABASE_STORAGE_ACCESS_KEY_ID = os.getenv('SUPABASE_STORAGE_ACCESS_KEY_ID', '').strip()
+    SUPABASE_STORAGE_SECRET_ACCESS_KEY = os.getenv('SUPABASE_STORAGE_SECRET_ACCESS_KEY', '').strip()
+
+    missing_supabase_settings = [
+        key
+        for key, value in {
+            'SUPABASE_STORAGE_BUCKET': SUPABASE_STORAGE_BUCKET,
+            'SUPABASE_STORAGE_ENDPOINT_URL': SUPABASE_STORAGE_ENDPOINT_URL,
+            'SUPABASE_STORAGE_REGION': SUPABASE_STORAGE_REGION,
+            'SUPABASE_STORAGE_ACCESS_KEY_ID': SUPABASE_STORAGE_ACCESS_KEY_ID,
+            'SUPABASE_STORAGE_SECRET_ACCESS_KEY': SUPABASE_STORAGE_SECRET_ACCESS_KEY,
+        }.items()
+        if not value
+    ]
+    if missing_supabase_settings:
+        raise ImproperlyConfigured(
+            'Supabase storage is enabled, but these settings are missing: '
+            + ', '.join(missing_supabase_settings)
+        )
+
+    SUPABASE_MEDIA_LOCATION = os.getenv('SUPABASE_MEDIA_LOCATION', 'media').strip().strip('/')
+    SUPABASE_STORAGE_QUERYSTRING_AUTH = (
+        os.getenv('SUPABASE_STORAGE_QUERYSTRING_AUTH', 'true').lower() == 'true'
+    )
+
+    AWS_ACCESS_KEY_ID = SUPABASE_STORAGE_ACCESS_KEY_ID
+    AWS_SECRET_ACCESS_KEY = SUPABASE_STORAGE_SECRET_ACCESS_KEY
+    AWS_STORAGE_BUCKET_NAME = SUPABASE_STORAGE_BUCKET
+    AWS_S3_ENDPOINT_URL = SUPABASE_STORAGE_ENDPOINT_URL
+    AWS_S3_REGION_NAME = SUPABASE_STORAGE_REGION
+    AWS_S3_ADDRESSING_STYLE = os.getenv('SUPABASE_STORAGE_ADDRESSING_STYLE', 'path').strip() or 'path'
+    AWS_S3_SIGNATURE_VERSION = 's3v4'
+    AWS_S3_FILE_OVERWRITE = False
+    AWS_DEFAULT_ACL = None
+    AWS_QUERYSTRING_AUTH = SUPABASE_STORAGE_QUERYSTRING_AUTH
+    AWS_QUERYSTRING_EXPIRE = int(os.getenv('SUPABASE_STORAGE_URL_TTL_SECONDS', '3600'))
+    AWS_S3_OBJECT_PARAMETERS = {
+        'CacheControl': os.getenv('SUPABASE_STORAGE_CACHE_CONTROL', 'max-age=86400'),
+    }
+    STORAGES = {
+        'default': {
+            'BACKEND': 'backend.storage_backends.SupabaseMediaStorage',
+        },
+        'staticfiles': {
+            'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+        },
+    }
 
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()

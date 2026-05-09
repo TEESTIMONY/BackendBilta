@@ -84,6 +84,42 @@ In practice, that means:
 4. Paste it into `DATABASE_URL` on Render
 5. Keep the `sslmode=require` portion if Supabase includes it in the URL
 
+## Supabase Storage
+
+Uploaded media can also be stored in a Supabase bucket instead of Render's local
+disk. This is the better long-term setup for job attachments and other uploaded
+design assets.
+
+This repo now supports that through Django's default media storage. When enabled,
+uploaded files will be written to Supabase Storage over its S3-compatible
+endpoint.
+
+Set these environment variables:
+
+- `USE_SUPABASE_STORAGE=true`
+- `SUPABASE_STORAGE_BUCKET` = your Supabase bucket name
+- `SUPABASE_STORAGE_ENDPOINT_URL` = your Supabase S3 endpoint
+- `SUPABASE_STORAGE_REGION` = your Supabase storage region from project settings
+- `SUPABASE_STORAGE_ACCESS_KEY_ID` = server-side S3 access key
+- `SUPABASE_STORAGE_SECRET_ACCESS_KEY` = server-side S3 secret
+- `SUPABASE_MEDIA_LOCATION=media`
+
+Recommended setup:
+
+1. Create a private bucket for uploads such as `bilta-media`
+2. In Supabase Storage settings, enable S3 access
+3. Generate server-side S3 credentials
+4. Copy the endpoint and region from the same settings screen
+5. Add the values above to Render
+
+Notes:
+
+- Keep the bucket private unless you intentionally want public files
+- Staff downloads will still work through the Django API
+- This mainly affects uploaded files like design assets and job attachments
+- Product images in the current schema are still URL-based, so they are not yet
+  being uploaded by Django into the bucket
+
 ## Render
 
 This export includes `render.yaml` for a temporary Render deployment, but it no
@@ -93,6 +129,12 @@ connection manually in the Render dashboard.
 Recommended Render environment variables:
 
 - `DATABASE_URL` = your Supabase `Session pooler` connection string
+- `USE_SUPABASE_STORAGE` = `true` when ready to store uploads in Supabase
+- `SUPABASE_STORAGE_BUCKET` = your private uploads bucket
+- `SUPABASE_STORAGE_ENDPOINT_URL` = your Supabase S3 endpoint
+- `SUPABASE_STORAGE_REGION` = your Supabase S3 region
+- `SUPABASE_STORAGE_ACCESS_KEY_ID` = your Supabase S3 access key
+- `SUPABASE_STORAGE_SECRET_ACCESS_KEY` = your Supabase S3 secret
 - `DJANGO_SECRET_KEY` = generated secret
 - `DJANGO_DEBUG` = `false`
 - `DJANGO_ALLOWED_HOSTS` = your Render hostname
