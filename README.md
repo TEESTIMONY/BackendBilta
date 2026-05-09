@@ -129,6 +129,9 @@ connection manually in the Render dashboard.
 Recommended Render environment variables:
 
 - `DATABASE_URL` = your Supabase `Session pooler` connection string
+- `DJANGO_SUPERUSER_USERNAME` = optional bootstrap admin username
+- `DJANGO_SUPERUSER_PASSWORD` = optional bootstrap admin password
+- `DJANGO_SUPERUSER_EMAIL` = optional bootstrap admin email
 - `USE_SUPABASE_STORAGE` = `true` when ready to store uploads in Supabase
 - `SUPABASE_STORAGE_BUCKET` = your private uploads bucket
 - `SUPABASE_STORAGE_ENDPOINT_URL` = your Supabase S3 endpoint
@@ -142,9 +145,13 @@ Recommended Render environment variables:
 - `CORS_ALLOWED_ORIGINS` = your Vercel frontend URL
 - `CSRF_TRUSTED_ORIGINS` = your Vercel frontend URL and your Render backend URL
 
-After the first deploy:
+If shell access is unavailable on your Render plan, you can still create the
+first owner/admin by setting:
 
-```bash
-python manage.py migrate
-python manage.py createsuperuser
-```
+- `DJANGO_SUPERUSER_USERNAME`
+- `DJANGO_SUPERUSER_PASSWORD`
+- `DJANGO_SUPERUSER_EMAIL`
+
+The deploy start command will run `python manage.py ensure_superuser` after
+migrations. It creates the user if missing and updates that same username on
+later deploys.
