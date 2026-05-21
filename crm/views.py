@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -304,7 +304,7 @@ class JobViewSet(viewsets.ModelViewSet):
     @decorators.action(detail=False, methods=['get'])
     def queue(self, request):
         now = timezone.now()
-        qs = self.get_queryset().exclude(status__in=[Job.JobStatus.COMPLETED, Job.JobStatus.CANCELLED])
+        qs = self.get_queryset().exclude(status=Job.JobStatus.CANCELLED)
         data = self.get_serializer(qs, many=True).data
         for row in data:
             deadline = row.get('deadline')
@@ -572,25 +572,32 @@ def daily_summary(request):
     if date_param:
         target = datetime.strptime(date_param, '%Y-%m-%d').date()
 
-    jobs = Job.objects.filter(created_at__date=target)
-    completed_jobs = jobs.filter(status=Job.JobStatus.COMPLETED)
-    payments = PaymentRecord.objects.filter(created_at__date=target)
-    photocopy = PhotocopySession.objects.filter(created_at__date=target)
+    start_of_day = timezone.make_aware(datetime.combine(target, datetime.min.time()))
+    end_of_day = start_of_day + timedelta(days=1)
 
-    outstanding_balances = jobs.aggregate(total=Sum('balance_due')).get('total') or Decimal('0.00')
+    jobs_created = Job.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+    jobs_completed = Job.objects.filter(
+        status=Job.JobStatus.COMPLETED,
+        updated_at__gte=start_of_day,
+        updated_at__lt=end_of_day,
+    )
+    payments = PaymentRecord.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+    photocopy = PhotocopySession.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+
+    outstanding_balances = jobs_created.aggregate(total=Sum('balance_due')).get('total') or Decimal('0.00')
     total_revenue = payments.aggregate(total=Sum('amount')).get('total') or Decimal('0.00')
     photocopy_revenue = photocopy.aggregate(total=Sum('actual_cash_collected')).get('total') or Decimal('0.00')
 
     anomalies = {
-        'completed_unpaid_jobs': completed_jobs.exclude(payment_status=Job.PaymentStatus.PAID).count(),
+        'completed_unpaid_jobs': jobs_completed.exclude(payment_status=Job.PaymentStatus.PAID).count(),
         'photocopy_discrepancies': photocopy.filter(has_discrepancy=True).count(),
     }
 
     return response.Response(
         {
             'date': str(target),
-            'jobs_created': jobs.count(),
-            'jobs_completed': completed_jobs.count(),
+            'jobs_created': jobs_created.count(),
+            'jobs_completed': jobs_completed.count(),
             'payments_received': payments.count(),
             'photocopy_sessions': photocopy.count(),
             'total_revenue': total_revenue,

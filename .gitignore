@@ -1,11 +1,33 @@
-__pycache__/
-*.py[cod]
-*.sqlite3
-.env
-.venv/
-venv/
-media/
-staticfiles/
-job_attachments/
-.pytest_cache/
-.mypy_cache/
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+media
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# # Keep backend-only code out of the frontend repo
+# backend/
+# crm/
+# manage.py
+# requirements.txt
+# Procfile
+# db.sqlite3

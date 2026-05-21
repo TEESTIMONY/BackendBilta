@@ -336,6 +336,37 @@ class ApiSmokeTests(APITestCase):
         daily_summary = self.staff_client.get('/api/reports/daily-summary/')
         self.assertEqual(daily_summary.status_code, 200, daily_summary.data)
 
+    def test_job_queue_keeps_completed_jobs_available_but_hides_cancelled_jobs(self):
+        completed_job = Job.objects.create(
+            customer=self.customer,
+            created_by=self.staff,
+            updated_by=self.staff,
+            job_type='printing',
+            description='Completed with outstanding payment',
+            quantity=1,
+            unit_price='1000.00',
+            amount_paid='400.00',
+            status=Job.JobStatus.COMPLETED,
+        )
+        cancelled_job = Job.objects.create(
+            customer=self.customer,
+            created_by=self.staff,
+            updated_by=self.staff,
+            job_type='binding',
+            description='Cancelled job should stay hidden',
+            quantity=1,
+            unit_price='500.00',
+            amount_paid='0.00',
+            status=Job.JobStatus.CANCELLED,
+        )
+
+        response = self.staff_client.get('/api/jobs/queue/')
+        self.assertEqual(response.status_code, 200, response.data)
+
+        returned_ids = {row['id'] for row in response.data}
+        self.assertIn(completed_job.id, returned_ids)
+        self.assertNotIn(cancelled_job.id, returned_ids)
+
     def test_owner_management_endpoints(self):
         setting = self.create_setting()
         template = self.create_message_template()
