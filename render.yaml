@@ -5,7 +5,10 @@ services:
     plan: free
     region: frankfurt
     buildCommand: pip install -r requirements.txt && python manage.py collectstatic --noinput
-    startCommand: python manage.py migrate && gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT
+    startCommand: >-
+      python manage.py migrate &&
+      python manage.py shell -c "import os; from django.contrib.auth import get_user_model; User = get_user_model(); username = os.environ.get('DJANGO_SUPERUSER_USERNAME'); email = os.environ.get('DJANGO_SUPERUSER_EMAIL', ''); password = os.environ.get('DJANGO_SUPERUSER_PASSWORD'); (username and password) and User.objects.filter(username=username).exists() or ((username and password) and User.objects.create_superuser(username=username, email=email, password=password))" &&
+      gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT
     healthCheckPath: /api/health/
     envVars:
       - key: DJANGO_SECRET_KEY
@@ -26,6 +29,12 @@ services:
         value: "true"
       - key: DJANGO_CSRF_COOKIE_SECURE
         value: "true"
+      - key: DJANGO_SUPERUSER_USERNAME
+        sync: false
+      - key: DJANGO_SUPERUSER_EMAIL
+        sync: false
+      - key: DJANGO_SUPERUSER_PASSWORD
+        sync: false
 
 databases:
   - name: bilta-db
