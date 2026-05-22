@@ -35,7 +35,7 @@ def parse_public_money(value):
 
     cleaned = (
         raw.replace('₦', '')
-        .replace('â‚¦', '')
+        .replace('₦', '')
         .replace(',', '')
         .replace(' ', '')
     )
