@@ -690,3 +690,50 @@ class ApiSmokeTests(APITestCase):
         )
         self.assertEqual(checkout.status_code, 201, checkout.data)
         self.assertEqual(Job.objects.get(id=checkout.data['job_id']).payment_status, Job.PaymentStatus.UNPAID)
+
+    def test_amount_paid_on_a_job_is_backed_by_payment_records(self):
+        def job_payments(job_id):
+            return list(PaymentRecord.objects.filter(job_id=job_id).order_by('id'))
+
+        # Nothing paid: no payment entry, job unpaid.
+        unpaid = self.staff_client.post(
+            '/api/jobs/',
+            {'customer': self.customer.id, 'job_type': 'printing', 'quantity': 1, 'unit_price': '1000.00'},
+            format='json',
+        )
+        self.assertEqual(job_payments(unpaid.data['id']), [])
+
+        # "Amount paid now" at creation: one payment entry recorded by that staff member.
+        created = self.staff_client.post(
+            '/api/jobs/',
+            {
+                'customer': self.customer.id,
+                'job_type': 'printing',
+                'quantity': 1,
+                'unit_price': '1000.00',
+                'amount_paid': '400.00',
+            },
+            format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        job_id = created.data['id']
+        payments = job_payments(job_id)
+        self.assertEqual([p.amount for p in payments], [Decimal('400.00')])
+        self.assertEqual(payments[0].recorded_by, self.staff)
+
+        # Owner corrections are logged as adjustments, so the entries always sum to amount_paid.
+        self.owner_client.patch(f'/api/jobs/{job_id}/', {'amount_paid': '1000.00'}, format='json')
+        self.owner_client.patch(f'/api/jobs/{job_id}/', {'amount_paid': '700.00'}, format='json')
+        payments = job_payments(job_id)
+        self.assertEqual([p.amount for p in payments], [Decimal('400.00'), Decimal('600.00'), Decimal('-300.00')])
+        job = Job.objects.get(id=job_id)
+        self.assertEqual(sum(p.amount for p in payments), job.amount_paid)
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PARTIAL)
+
+        # A status-only update adds nothing.
+        self.staff_client.patch(f'/api/jobs/{job_id}/', {'status': 'completed'}, format='json')
+        self.assertEqual(len(job_payments(job_id)), 3)
+
+        # Daily revenue now matches what the jobs say was collected.
+        summary = self.staff_client.get('/api/reports/daily-summary/').data
+        self.assertEqual(Decimal(str(summary['total_revenue'])), job.amount_paid)

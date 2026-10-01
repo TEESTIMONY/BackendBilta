@@ -306,8 +306,23 @@ class JobViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'deadline', 'updated_at', 'total']
     permission_classes = [IsStaffWriteOwnerDelete]
 
+    def _log_amount_paid_change(self, job, delta, note):
+        # Money entered directly on a job ("Amount paid now", owner corrections) gets a
+        # matching PaymentRecord so the payment log and daily revenue agree with the job.
+        if not delta:
+            return
+        PaymentRecord.objects.create(
+            job=job,
+            amount=delta,
+            source=PaymentRecord.PaymentSource.JOB,
+            recorded_by=self.request.user if self.request.user.is_authenticated else None,
+            note=note,
+        )
+
     def perform_create(self, serializer):
-        job = serializer.save(created_by=self.request.user if self.request.user.is_authenticated else None)
+        with transaction.atomic():
+            job = serializer.save(created_by=self.request.user if self.request.user.is_authenticated else None)
+            self._log_amount_paid_change(job, job.amount_paid, 'Paid when the job was created.')
         job.customer.last_job_date = timezone.now()
         job.customer.save(update_fields=['last_job_date', 'updated_at'])
         JobStatusHistory.objects.create(job=job, from_status='', to_status=job.status, changed_by=self.request.user if self.request.user.is_authenticated else None)
@@ -325,7 +340,14 @@ class JobViewSet(viewsets.ModelViewSet):
                     }
                 )
         old_status = previous.status
-        job = serializer.save(updated_by=self.request.user if self.request.user.is_authenticated else None)
+        old_amount_paid = previous.amount_paid
+        with transaction.atomic():
+            job = serializer.save(updated_by=self.request.user if self.request.user.is_authenticated else None)
+            self._log_amount_paid_change(
+                job,
+                job.amount_paid - old_amount_paid,
+                f'Owner adjusted amount paid from {old_amount_paid} to {job.amount_paid}.',
+            )
         job.customer.last_job_date = timezone.now()
         job.customer.save(update_fields=['last_job_date', 'updated_at'])
         if old_status != job.status:
