@@ -244,9 +244,16 @@ class Job(TimeStampedModel):
         ordering = ['deadline', '-created_at']
 
     def save(self, *args, **kwargs):
+        # Values may arrive as strings or ints (e.g. Job.objects.create(unit_price='10.00')).
+        self.quantity = int(self.quantity)
+        self.unit_price = Decimal(str(self.unit_price or '0'))
+        self.amount_paid = Decimal(str(self.amount_paid or '0'))
         self.total = Decimal(self.quantity) * self.unit_price
         self.balance_due = max(Decimal('0.00'), self.total - self.amount_paid)
-        if self.balance_due == Decimal('0.00'):
+        if self.total == Decimal('0.00') and self.amount_paid == Decimal('0.00'):
+            # Nothing priced yet (e.g. website requests awaiting a quote): not paid.
+            self.payment_status = self.PaymentStatus.UNPAID
+        elif self.balance_due == Decimal('0.00'):
             self.payment_status = self.PaymentStatus.PAID
         elif self.amount_paid > Decimal('0.00'):
             self.payment_status = self.PaymentStatus.PARTIAL

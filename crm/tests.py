@@ -1,7 +1,12 @@
 import json
+import shutil
+import tempfile
+from datetime import timedelta
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient, APITestCase
@@ -11,7 +16,16 @@ from .models import AuditLog, Customer, Job, JobAttachment, Order, PaymentRecord
 User = get_user_model()
 
 
+TEST_MEDIA_ROOT = tempfile.mkdtemp(prefix='bilta-test-media-')
+
+
+@override_settings(MEDIA_ROOT=TEST_MEDIA_ROOT)
 class ApiSmokeTests(APITestCase):
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(TEST_MEDIA_ROOT, ignore_errors=True)
+
     def setUp(self):
         self.owner_password = 'StrongPass!234'
         self.staff_password = 'StrongPass!234'
@@ -87,7 +101,7 @@ class ApiSmokeTests(APITestCase):
             'amount_paid': '0.00',
             'internal_notes': 'API order note',
         }
-        response = self.client.post('/api/orders/', payload, format='json')
+        response = self.staff_client.post('/api/orders/', payload, format='json')
         self.assertEqual(response.status_code, 201, response.data)
         return response.data
 
@@ -261,8 +275,19 @@ class ApiSmokeTests(APITestCase):
 
         attachment = JobAttachment.objects.filter(job=design_job).first()
         self.assertIsNotNone(attachment)
-        download_response = self.client.get(f'/api/job-attachments/{attachment.id}/download/')
+        unsigned_response = self.client.get(f'/api/job-attachments/{attachment.id}/download/')
+        self.assertEqual(unsigned_response.status_code, 403)
+
+        job_detail = self.staff_client.get(f'/api/jobs/{design_job.id}/')
+        signed_url = job_detail.data['attachments'][0]['download_url']
+        download_response = self.client.get(signed_url)
         self.assertEqual(download_response.status_code, 200)
+
+        other_attachment = JobAttachment.objects.get(job=checkout_job)
+        forged_url = signed_url.replace(
+            f'/job-attachments/{attachment.id}/', f'/job-attachments/{other_attachment.id}/'
+        )
+        self.assertEqual(self.client.get(forged_url).status_code, 403)
 
     def test_auth_endpoints(self):
         response = self.client.post(
@@ -316,9 +341,9 @@ class ApiSmokeTests(APITestCase):
         payment = self.create_payment()
         session = self.create_photocopy_session()
 
-        self.assertEqual(self.client.get('/api/orders/').status_code, 200)
-        self.assertEqual(self.client.get(f"/api/orders/{order['id']}/").status_code, 200)
-        self.assertEqual(self.client.get('/api/orders/monthly_report/').status_code, 200)
+        self.assertEqual(self.staff_client.get('/api/orders/').status_code, 200)
+        self.assertEqual(self.staff_client.get(f"/api/orders/{order['id']}/").status_code, 200)
+        self.assertEqual(self.staff_client.get('/api/orders/monthly_report/').status_code, 200)
 
         self.assertEqual(self.staff_client.get('/api/jobs/').status_code, 200)
         self.assertEqual(self.staff_client.get(f"/api/jobs/{job['id']}/").status_code, 200)
@@ -378,14 +403,14 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(self.staff_client.get('/api/settings/').status_code, 200)
         self.assertEqual(self.staff_client.get(f"/api/settings/{setting['id']}/").status_code, 200)
 
-        self.assertEqual(self.client.get('/api/message-templates/').status_code, 200)
-        self.assertEqual(self.client.get(f"/api/message-templates/{template['id']}/").status_code, 200)
+        self.assertEqual(self.staff_client.get('/api/message-templates/').status_code, 200)
+        self.assertEqual(self.staff_client.get(f"/api/message-templates/{template['id']}/").status_code, 200)
 
-        self.assertEqual(self.client.get('/api/order-message-logs/').status_code, 200)
-        self.assertEqual(self.client.get(f"/api/order-message-logs/{message_log['id']}/").status_code, 200)
+        self.assertEqual(self.staff_client.get('/api/order-message-logs/').status_code, 200)
+        self.assertEqual(self.staff_client.get(f"/api/order-message-logs/{message_log['id']}/").status_code, 200)
 
-        self.assertEqual(self.client.get('/api/announcements/').status_code, 200)
-        self.assertEqual(self.client.get(f"/api/announcements/{announcement['id']}/").status_code, 200)
+        self.assertEqual(self.staff_client.get('/api/announcements/').status_code, 200)
+        self.assertEqual(self.staff_client.get(f"/api/announcements/{announcement['id']}/").status_code, 200)
         self.assertEqual(self.client.get('/api/announcements/active/').status_code, 200)
 
         self.assertEqual(self.owner_client.get('/api/staff-invitations/').status_code, 200)
@@ -424,3 +449,137 @@ class ApiSmokeTests(APITestCase):
         self.assertIsNotNone(audit_log)
         audit_detail = self.owner_client.get(f'/api/audit-logs/{audit_log.id}/')
         self.assertEqual(audit_detail.status_code, 200)
+
+    def test_internal_endpoints_reject_anonymous_users(self):
+        order = self.create_order()
+        template = self.create_message_template()
+        self.create_announcement()
+
+        for url in (
+            '/api/orders/',
+            f"/api/orders/{order['id']}/",
+            '/api/orders/monthly_report/',
+            '/api/message-templates/',
+            f"/api/message-templates/{template['id']}/",
+            '/api/order-message-logs/',
+            '/api/announcements/',
+            '/api/customers/',
+            '/api/jobs/',
+        ):
+            self.assertIn(self.client.get(url).status_code, (401, 403), url)
+
+        self.assertIn(
+            self.client.delete(f"/api/orders/{order['id']}/").status_code, (401, 403)
+        )
+        self.assertIn(
+            self.client.post('/api/announcements/', {'title': 'x', 'message': 'y'}, format='json').status_code,
+            (401, 403),
+        )
+        self.assertTrue(Order.objects.filter(id=order['id']).exists())
+
+    def test_public_submission_does_not_overwrite_existing_customer(self):
+        payload = {
+            'first_name': 'Someone',
+            'last_name': 'Else',
+            'country': 'Nigeria',
+            'street_address': '1 Other Street',
+            'phone': '08099999999',
+            'email': self.customer.email,
+            'items': [{'title': 'Flyers', 'price': 'Price on request', 'quantity': 1}],
+        }
+        response = self.client.post('/api/public/order-requests/checkout/', payload, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.full_name, 'API Customer')
+        self.assertEqual(self.customer.phone, '08001234567')
+
+        job = Job.objects.get(id=response.data['job_id'])
+        self.assertEqual(job.customer_id, self.customer.id)
+        self.assertIn('Someone Else', job.special_instructions)
+        self.assertIn('08099999999', job.special_instructions)
+        # Unpriced requests must not be reported as paid.
+        self.assertEqual(job.payment_status, Job.PaymentStatus.UNPAID)
+
+    def test_checkout_total_matches_item_subtotal(self):
+        payload = {
+            'first_name': 'Sum',
+            'last_name': 'Check',
+            'country': 'Nigeria',
+            'street_address': '2 Street',
+            'phone': '08077777777',
+            'email': 'sum-check@example.com',
+            'items': [
+                {'title': 'Cards', 'price': '₦10,000', 'quantity': 1},
+                {'title': 'Flyers', 'price': '₦5,000', 'quantity': 2},
+            ],
+        }
+        response = self.client.post('/api/public/order-requests/checkout/', payload, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        job = Job.objects.get(id=response.data['job_id'])
+        self.assertEqual(job.total, Decimal('20000.00'))
+
+    def test_payment_edit_and_delete_keep_job_balance_in_sync(self):
+        job = Job.objects.create(
+            customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('1000.00')
+        )
+        created = self.staff_client.post(
+            '/api/payments/', {'job': job.id, 'amount': '300.00', 'source': 'job'}, format='json'
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        job.refresh_from_db()
+        self.assertEqual(job.amount_paid, Decimal('300.00'))
+
+        updated = self.staff_client.patch(
+            f"/api/payments/{created.data['id']}/",
+            {'amount': '1000.00', 'edit_reason': 'Typo'},
+            format='json',
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        job.refresh_from_db()
+        self.assertEqual(job.amount_paid, Decimal('1000.00'))
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PAID)
+
+        deleted = self.owner_client.delete(f"/api/payments/{created.data['id']}/")
+        self.assertEqual(deleted.status_code, 204)
+        job.refresh_from_db()
+        self.assertEqual(job.amount_paid, Decimal('0.00'))
+        self.assertEqual(job.payment_status, Job.PaymentStatus.UNPAID)
+
+    def test_daily_summary_rejects_bad_date(self):
+        response = self.staff_client.get('/api/reports/daily-summary/?date=not-a-date')
+        self.assertEqual(response.status_code, 400)
+
+    def test_login_is_rate_limited(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        statuses = [
+            self.client.post(
+                '/api/auth/login/', {'username': self.owner.username, 'password': 'wrong'}, format='json'
+            ).status_code
+            for _ in range(11)
+        ]
+        cache.clear()
+        self.assertEqual(statuses[:10], [400] * 10)
+        self.assertEqual(statuses[10], 429)
+
+    def test_queue_only_shows_todays_jobs_and_records_filter_by_day(self):
+        today_job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1)
+        old_job = Job.objects.create(customer=self.customer, job_type='binding', quantity=1)
+        yesterday = timezone.localdate() - timedelta(days=1)
+        Job.objects.filter(id=old_job.id).update(created_at=timezone.now() - timedelta(days=1))
+
+        queue_ids = {row['id'] for row in self.staff_client.get('/api/jobs/queue/').data}
+        self.assertIn(today_job.id, queue_ids)
+        self.assertNotIn(old_job.id, queue_ids)
+
+        yesterday_queue = self.staff_client.get(f'/api/jobs/queue/?date={yesterday}')
+        self.assertEqual({row['id'] for row in yesterday_queue.data}, {old_job.id})
+
+        records = self.staff_client.get(f'/api/jobs/?created_on={yesterday}')
+        self.assertEqual(records.status_code, 200, records.data)
+        self.assertEqual({row['id'] for row in records.data['results']}, {old_job.id})
+
+        self.assertEqual(self.staff_client.get('/api/jobs/?created_on=bad').status_code, 400)
+        self.assertEqual(self.staff_client.get('/api/jobs/queue/?date=bad').status_code, 400)

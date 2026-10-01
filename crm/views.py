@@ -3,12 +3,14 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core import signing
+from django.db import transaction
 from django.http import FileResponse
 from django.db.models import Count, Q, Sum
 from django.db.models.functions import TruncMonth
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import decorators, permissions, response, serializers, status, viewsets
+from rest_framework import decorators, permissions, response, serializers, status, throttling, viewsets
 from rest_framework.authtoken.models import Token
 
 from .models import (
@@ -28,6 +30,8 @@ from .models import (
     SystemSetting,
 )
 from .serializers import (
+    ATTACHMENT_LINK_MAX_AGE_SECONDS,
+    ATTACHMENT_LINK_SALT,
     AnnouncementSerializer,
     AuditLogSerializer,
     AuthLoginSerializer,
@@ -97,6 +101,17 @@ class IsStaffReadOwnerWrite(permissions.BasePermission):
         return is_owner_user(request.user)
 
 
+class LoginRateThrottle(throttling.SimpleRateThrottle):
+    """Limits sign-in attempts per username, or per client when no username is sent."""
+
+    scope = 'login'
+
+    def get_cache_key(self, request, view):
+        data = request.data if hasattr(request.data, 'get') else {}
+        username = str(data.get('username', '') or '').strip().lower()
+        return self.cache_format % {'scope': self.scope, 'ident': username or self.get_ident(request)}
+
+
 def write_audit(action, model_name, object_id='', user=None, reason='', metadata=None):
     AuditLog.objects.create(
         action=action,
@@ -106,6 +121,13 @@ def write_audit(action, model_name, object_id='', user=None, reason='', metadata
         reason=reason or '',
         metadata=metadata or {},
     )
+
+
+def parse_date_param(value, name):
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').date()
+    except (TypeError, ValueError) as exc:
+        raise serializers.ValidationError({name: 'Invalid date format. Use YYYY-MM-DD.'}) from exc
 
 
 def parse_public_payload(request):
@@ -177,6 +199,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
     search_fields = ['code', 'customer__full_name', 'customer__phone', 'internal_notes']
     ordering_fields = ['created_at', 'updated_at', 'payment_date', 'due_date', 'total_amount']
+    permission_classes = [IsStaffWriteOwnerDelete]
 
     @decorators.action(detail=False, methods=['get'])
     def monthly_report(self, request):
@@ -237,6 +260,7 @@ class MessageTemplateViewSet(viewsets.ModelViewSet):
     serializer_class = MessageTemplateSerializer
     search_fields = ['name', 'stage', 'body']
     ordering_fields = ['stage', 'name', 'updated_at']
+    permission_classes = [IsStaffReadOwnerWrite]
 
 
 class OrderMessageLogViewSet(viewsets.ModelViewSet):
@@ -244,6 +268,7 @@ class OrderMessageLogViewSet(viewsets.ModelViewSet):
     serializer_class = OrderMessageLogSerializer
     search_fields = ['order__code', 'customer__full_name', 'stage', 'message_body']
     ordering_fields = ['sent_at', 'created_at']
+    permission_classes = [IsStaffWriteOwnerDelete]
 
 
 class AnnouncementViewSet(viewsets.ModelViewSet):
@@ -251,6 +276,12 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
     serializer_class = AnnouncementSerializer
     search_fields = ['title', 'message']
     ordering_fields = ['created_at', 'starts_at', 'ends_at']
+
+    def get_permissions(self):
+        # Only the currently live announcement is public; drafts and history stay internal.
+        if self.action == 'active':
+            return [permissions.AllowAny()]
+        return [IsStaffReadOwnerWrite()]
 
     @decorators.action(detail=False, methods=['get'])
     def active(self, request):
@@ -301,10 +332,21 @@ class JobViewSet(viewsets.ModelViewSet):
             JobStatusHistory.objects.create(job=job, from_status=old_status, to_status=job.status, changed_by=self.request.user if self.request.user.is_authenticated else None)
         write_audit('update', 'Job', job.id, self.request.user)
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        created_on = self.request.query_params.get('created_on')
+        if created_on:
+            queryset = queryset.filter(created_at__date=parse_date_param(created_on, 'created_on'))
+        return queryset
+
     @decorators.action(detail=False, methods=['get'])
     def queue(self, request):
+        # The desk only works on the current day's jobs (Africa/Lagos); earlier days
+        # are reviewed from the Records page via ?created_on=.
         now = timezone.now()
-        qs = self.get_queryset().exclude(status=Job.JobStatus.CANCELLED)
+        date_param = request.query_params.get('date')
+        target = parse_date_param(date_param, 'date') if date_param else timezone.localdate()
+        qs = self.get_queryset().filter(created_at__date=target).exclude(status=Job.JobStatus.CANCELLED)
         data = self.get_serializer(qs, many=True).data
         for row in data:
             deadline = row.get('deadline')
@@ -323,20 +365,41 @@ class PaymentRecordViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'amount']
     permission_classes = [IsStaffWriteOwnerDelete]
 
+    @staticmethod
+    def _adjust_job_paid(job_id, delta):
+        if not job_id or not delta:
+            return
+        job = Job.objects.select_for_update().get(pk=job_id)
+        job.amount_paid = max(Decimal('0.00'), (job.amount_paid or Decimal('0.00')) + delta)
+        job.save()
+
     def perform_create(self, serializer):
-        payment = serializer.save(recorded_by=self.request.user if self.request.user.is_authenticated else None)
-        if payment.job_id:
-            job = payment.job
-            job.amount_paid = (job.amount_paid or Decimal('0.00')) + payment.amount
-            job.save()
+        with transaction.atomic():
+            payment = serializer.save(recorded_by=self.request.user if self.request.user.is_authenticated else None)
+            self._adjust_job_paid(payment.job_id, payment.amount)
         write_audit('create', 'PaymentRecord', payment.id, self.request.user)
 
     def perform_update(self, serializer):
-        reason = self.request.data.get('edit_reason', '').strip()
+        reason = str(self.request.data.get('edit_reason', '') or '').strip()
         if not reason:
             raise serializers.ValidationError({'edit_reason': 'edit_reason is required when editing a payment'})
-        payment = serializer.save()
+        with transaction.atomic():
+            previous = PaymentRecord.objects.select_for_update().get(pk=serializer.instance.pk)
+            old_job_id, old_amount = previous.job_id, previous.amount
+            payment = serializer.save()
+            if old_job_id == payment.job_id:
+                self._adjust_job_paid(payment.job_id, payment.amount - old_amount)
+            else:
+                self._adjust_job_paid(old_job_id, -old_amount)
+                self._adjust_job_paid(payment.job_id, payment.amount)
         write_audit('update', 'PaymentRecord', payment.id, self.request.user, reason=reason)
+
+    def perform_destroy(self, instance):
+        payment_id = instance.id
+        with transaction.atomic():
+            self._adjust_job_paid(instance.job_id, -instance.amount)
+            instance.delete()
+        write_audit('delete', 'PaymentRecord', payment_id, self.request.user)
 
 
 class PhotocopySessionViewSet(viewsets.ModelViewSet):
@@ -425,6 +488,7 @@ class StaffInvitationViewSet(viewsets.ModelViewSet):
 
 @decorators.api_view(['POST'])
 @decorators.permission_classes([permissions.AllowAny])
+@decorators.throttle_classes([LoginRateThrottle])
 def auth_login(request):
     serializer = AuthLoginSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -472,6 +536,7 @@ def staff_invitation_detail(request, token):
 
 @decorators.api_view(['POST'])
 @decorators.permission_classes([permissions.AllowAny])
+@decorators.throttle_classes([LoginRateThrottle])
 def staff_invitation_accept(request):
     serializer = StaffInvitationAcceptSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -490,6 +555,21 @@ def staff_invitation_accept(request):
 @decorators.api_view(['GET'])
 @decorators.permission_classes([permissions.AllowAny])
 def job_attachment_download(request, pk):
+    # Staff open attachments through plain links (no auth header), so accept either a
+    # logged-in staff user or a short-lived signature issued by JobAttachmentSerializer.
+    if not is_staff_user(request.user):
+        try:
+            signed_pk = signing.TimestampSigner(salt=ATTACHMENT_LINK_SALT).unsign(
+                request.query_params.get('sig', ''),
+                max_age=ATTACHMENT_LINK_MAX_AGE_SECONDS,
+            )
+        except signing.BadSignature:
+            signed_pk = None
+        if signed_pk != str(pk):
+            return response.Response(
+                {'detail': 'This download link is invalid or has expired.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
     attachment = get_object_or_404(JobAttachment, pk=pk)
     return FileResponse(
         attachment.file.open('rb'),
@@ -570,7 +650,10 @@ def daily_summary(request):
     date_param = request.query_params.get('date')
     target = timezone.localdate()
     if date_param:
-        target = datetime.strptime(date_param, '%Y-%m-%d').date()
+        try:
+            target = datetime.strptime(date_param, '%Y-%m-%d').date()
+        except ValueError:
+            return response.Response({'detail': 'Invalid date format. Use YYYY-MM-DD.'}, status=400)
 
     start_of_day = timezone.make_aware(datetime.combine(target, datetime.min.time()))
     end_of_day = start_of_day + timedelta(days=1)
