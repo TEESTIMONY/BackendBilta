@@ -583,3 +583,110 @@ class ApiSmokeTests(APITestCase):
 
         self.assertEqual(self.staff_client.get('/api/jobs/?created_on=bad').status_code, 400)
         self.assertEqual(self.staff_client.get('/api/jobs/queue/?date=bad').status_code, 400)
+
+    def test_pending_job_moves_to_records_after_its_day_and_stays_unpaid(self):
+        created = self.staff_client.post(
+            '/api/jobs/',
+            {
+                'customer': self.customer.id,
+                'job_type': 'printing',
+                'description': 'Pending job left at end of day',
+                'quantity': 2,
+                'unit_price': '1500.00',
+                'status': 'pending',
+            },
+            format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        job_id = created.data['id']
+        self.assertEqual(created.data['payment_status'], Job.PaymentStatus.UNPAID)
+
+        queue_ids = {row['id'] for row in self.staff_client.get('/api/jobs/queue/').data}
+        self.assertIn(job_id, queue_ids)
+
+        # Midnight passes: the job now belongs to yesterday.
+        Job.objects.filter(id=job_id).update(created_at=timezone.now() - timedelta(days=1))
+        yesterday = timezone.localdate() - timedelta(days=1)
+
+        queue_ids = {row['id'] for row in self.staff_client.get('/api/jobs/queue/').data}
+        self.assertNotIn(job_id, queue_ids)
+
+        records = self.staff_client.get(f'/api/jobs/?created_on={yesterday}').data['results']
+        record = next(row for row in records if row['id'] == job_id)
+        self.assertEqual(record['status'], Job.JobStatus.PENDING)
+        self.assertEqual(record['payment_status'], Job.PaymentStatus.UNPAID)
+        self.assertEqual(Decimal(record['amount_paid']), Decimal('0.00'))
+        self.assertEqual(Decimal(record['balance_due']), Decimal('3000.00'))
+
+    def test_jobs_are_only_marked_paid_when_payment_is_recorded(self):
+        def create(**overrides):
+            payload = {
+                'customer': self.customer.id,
+                'job_type': 'printing',
+                'description': 'Payment status check',
+                'quantity': 1,
+                'unit_price': '1000.00',
+                'status': 'pending',
+                **overrides,
+            }
+            response = self.staff_client.post('/api/jobs/', payload, format='json')
+            self.assertEqual(response.status_code, 201, response.data)
+            return Job.objects.get(id=response.data['id'])
+
+        self.assertEqual(create().payment_status, Job.PaymentStatus.UNPAID)
+        self.assertEqual(create(unit_price='0.00').payment_status, Job.PaymentStatus.UNPAID)
+        self.assertEqual(create(amount_paid='400.00').payment_status, Job.PaymentStatus.PARTIAL)
+        self.assertEqual(create(amount_paid='1000.00').payment_status, Job.PaymentStatus.PAID)
+
+        # Clients cannot set payment_status directly.
+        forced = create(payment_status='paid')
+        self.assertEqual(forced.payment_status, Job.PaymentStatus.UNPAID)
+
+        # Completing, or moving through any status, does not mark a job paid.
+        job = create()
+        for status in ('in_progress', 'ready_for_pickup', 'completed'):
+            response = self.staff_client.patch(f'/api/jobs/{job.id}/', {'status': status}, format='json')
+            self.assertEqual(response.status_code, 200, response.data)
+            job.refresh_from_db()
+            self.assertEqual(job.payment_status, Job.PaymentStatus.UNPAID, status)
+
+        # Only recorded payments change it.
+        self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '600.00', 'source': 'job'}, format='json')
+        job.refresh_from_db()
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PARTIAL)
+        self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '400.00', 'source': 'job'}, format='json')
+        job.refresh_from_db()
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PAID)
+
+        # Website requests start unpaid, priced or not.
+        design = self.client.post(
+            '/api/public/order-requests/design/',
+            {
+                'product_title': 'Business Cards',
+                'quantity': 1,
+                'full_name': 'Web Visitor',
+                'phone': '08012121212',
+                'email': 'web-visitor@example.com',
+                'request_details': 'Simple design',
+                'no_logo': True,
+            },
+            format='json',
+        )
+        self.assertEqual(design.status_code, 201, design.data)
+        self.assertEqual(Job.objects.get(id=design.data['job_id']).payment_status, Job.PaymentStatus.UNPAID)
+
+        checkout = self.client.post(
+            '/api/public/order-requests/checkout/',
+            {
+                'first_name': 'Web',
+                'last_name': 'Buyer',
+                'country': 'Nigeria',
+                'street_address': '3 Street',
+                'phone': '08013131313',
+                'email': 'web-buyer@example.com',
+                'items': [{'title': 'Flyers', 'price': '\u20a65,000', 'quantity': 2}],
+            },
+            format='json',
+        )
+        self.assertEqual(checkout.status_code, 201, checkout.data)
+        self.assertEqual(Job.objects.get(id=checkout.data['job_id']).payment_status, Job.PaymentStatus.UNPAID)
