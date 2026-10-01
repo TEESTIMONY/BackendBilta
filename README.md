@@ -1,176 +1,68 @@
-# Bilta Frontend
+# Bilta Backend
 
-Bilta is a React + Vite frontend for showcasing print products and related service pages.
+Django + Django REST Framework API for the Bilta print shop: product catalogue, customers, jobs, payments, photocopy sessions, staff accounts and website order/design requests.
+
+The frontend lives in a separate repository (`bilta_frontend`).
 
 ## Run locally
 
 ```bash
-npm install
-npm run dev
-```
-
-## CMS-ready products setup (no custom backend required)
-
-The Shop and Product Details pages are wired to use a headless-CMS style endpoint.
-
-- If `VITE_CMS_PRODUCTS_URL` is provided, products are fetched from that URL.
-- If it is not provided (or fails), the app falls back to local products data.
-
-Priority order used by the app:
-1. Team editor local override (browser localStorage)
-2. Sanity dataset (if configured)
-3. Generic CMS URL (if configured)
-4. Local bundled products data (fallback)
-
-### 1) Configure environment
-
-Copy `.env.example` to `.env` and set:
-
-```env
-VITE_CMS_PRODUCTS_URL=https://your-cms-endpoint/products.json
-
-# Optional Sanity config
-VITE_SANITY_PROJECT_ID=your_project_id
-VITE_SANITY_DATASET=production
-VITE_SANITY_API_VERSION=2024-01-01
-```
-
-### 2) Expected CMS payload shape
-
-You can return either an array or `{ products, filters }` object.
-
-```json
-{
-  "filters": ["All Products", "BUSINESS CARDS", "POSTERS"],
-  "products": [
-    {
-      "slug": "one-sided-business-cards",
-      "category": "BUSINESS CARDS",
-      "title": "One-sided Business Cards",
-      "description": "Premium business cards for professional brand presentation.",
-      "image": "https://example.com/image.jpg",
-      "price": "₦12,000"
-    }
-  ]
-}
-```
-
-Required fields per product: `slug`, `category`, `title`, `image`.
-
-## Team products editor page
-
-A built-in team editing page is available at:
-
-`/team/products-editor`
-
-> Security note: this route is **disabled by default**.
-> Set `VITE_ENABLE_TEAM_EDITOR=true` only in private/internal environments.
-
-What it does:
-- Lets your team edit products quickly (title, slug, category, description, image, price)
-- Saves changes into browser localStorage
-- Overrides CMS/local data for that browser session/device
-- Supports image URL paste or local image upload (stored as Base64 in localStorage)
-
-Buttons:
-- **Save Team Data**: stores editable products for immediate use on Shop/Product pages
-- **Reset Team Data**: clears local override and returns to CMS/local source
-
-## Build
-
-```bash
-npm run build
-```
-
-## Django REST API backend (CRM/CMS MVP)
-
-A Django + DRF backend is now scaffolded in this repo for Bilta CRM/CMS operations.
-
-### Included MVP modules
-
-- Products
-- Customers
-- Orders (online + manual/job orders)
-- Order items
-- Message templates
-- Order message logs
-- Announcements
-- Monthly order report endpoint
-
-### API base
-
-- `/api/products/`
-- `/api/customers/`
-- `/api/orders/`
-- `/api/orders/monthly_report/?month=YYYY-MM`
-- `/api/message-templates/`
-- `/api/order-message-logs/`
-- `/api/announcements/`
-- `/api/announcements/active/`
-
-### Backend run steps
-
-1. Ensure env values in `.env` (see `.env.example` for backend keys).
-2. Run migrations:
-
-```bash
-python manage.py makemigrations
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 python manage.py migrate
-```
-
-3. Create admin user:
-
-```bash
 python manage.py createsuperuser
-```
-
-4. Run server:
-
-```bash
 python manage.py runserver
 ```
 
-5. Open admin:
+Settings are read from environment variables (see `.env.example`); the `.env` file is **not** loaded automatically, so export the values in your shell or hosting provider. With no variables set, the app runs in debug mode against SQLite.
 
-- `http://127.0.0.1:8000/admin/`
+Admin: `http://127.0.0.1:8000/admin/`
 
-### Notes
+## Tests
 
-- Current default DB is SQLite; settings are environment-driven for easy Postgres switch.
-- CORS is enabled for local frontend development.
-- Next integration step is to point frontend services to these `/api/*` endpoints instead of localStorage/CMS fallback.
+```bash
+python manage.py test crm
+```
 
-## Backend hosting readiness (Django API)
+## Access rules
 
-Backend is now prepared for production hosting with:
+Every endpoint is staff-only unless listed below. "Owner" means a superuser.
 
-- `gunicorn` process entry (`Procfile`)
-- `whitenoise` static file serving
-- `dj-database-url` support via `DATABASE_URL`
-- env-based production security toggles
-- `requirements.txt` for backend deployment installs
+| Endpoint | Anonymous | Staff | Owner |
+| --- | --- | --- | --- |
+| `GET /api/health/` | yes | yes | yes |
+| `/api/products/` | read | read | read + write |
+| `POST /api/public/order-requests/checkout/`, `.../design/` | yes | yes | yes |
+| `GET /api/announcements/active/` | yes | yes | yes |
+| `POST /api/auth/login/`, `/api/auth/invitations/...` | yes (rate limited) | yes | yes |
+| `GET /api/job-attachments/<id>/download/` | with signed link only | yes | yes |
+| customers, jobs, orders, payments, photocopy sessions, order message logs | no | read + write | + delete |
+| settings, message templates, announcements (list/edit) | no | read | read + write |
+| staff accounts, staff invitations, audit logs | no | no | yes |
 
-### Production env checklist
+Attachment `download_url` values returned by the jobs API are signed and expire after 12 hours.
 
-Set these values in your hosting provider:
+## Production environment
 
 ```env
-DJANGO_SECRET_KEY=your-strong-secret
+DJANGO_SECRET_KEY=<long random value>        # required when DJANGO_DEBUG=false
 DJANGO_DEBUG=false
-DJANGO_ALLOWED_HOSTS=your-api-domain.com
-
+DJANGO_ALLOWED_HOSTS=api.example.com         # the *.onrender.com host is added automatically on Render
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DBNAME
 
 DJANGO_SECURE_SSL_REDIRECT=true
 DJANGO_SESSION_COOKIE_SECURE=true
 DJANGO_CSRF_COOKIE_SECURE=true
-CSRF_TRUSTED_ORIGINS=https://your-api-domain.com
+CSRF_TRUSTED_ORIGINS=https://api.example.com
 
 CORS_ALLOW_ALL_ORIGINS=false
 CORS_ALLOWED_ORIGINS=https://your-frontend-domain.com
 ```
 
-### Deploy command sequence (generic)
+Optional: `USE_SUPABASE_STORAGE=true` plus the `SUPABASE_STORAGE_*` values stores uploaded files in a Supabase Storage bucket instead of local disk.
+
+Deploy sequence:
 
 ```bash
 python manage.py migrate
@@ -178,51 +70,21 @@ python manage.py collectstatic --noinput
 gunicorn backend.wsgi:application
 ```
 
-### Temporary Render deploy
+## Render
 
-This repo now includes a root [render.yaml](</c:/Users/testi/Documents/bilta/render.yaml:1>) blueprint for a temporary Render backend deploy.
+`render.yaml` defines a free Python web service that builds, collects static files, runs migrations on start and health-checks `/api/health/`. In the Render dashboard, set:
 
-What it provisions:
-- one free Python web service
-- one free Render Postgres database
-- generated Django secret key
-- automatic `migrate` on start
-- static file collection during build
-- health check at `/api/health/`
+- `DATABASE_URL` (external Postgres, e.g. Supabase)
+- `CORS_ALLOWED_ORIGINS` is preset in `render.yaml` to `https://bilta.com.ng` and `https://www.bilta.com.ng`. Add any other frontend URL (e.g. a Vercel preview) there, or the browser will block its API calls.
+- `DJANGO_ALLOWED_HOSTS`: only if you use a custom API domain
+- `SUPABASE_STORAGE_*` credentials
+- Optionally `DJANGO_SUPERUSER_USERNAME` / `_EMAIL` / `_PASSWORD` to create the first owner account on start
 
-Important Render caveats:
-- the free web service sleeps when idle
-- the free Postgres database expires after 30 days
-- SQLite should not be used on Render free because local filesystem changes are ephemeral
+The free service sleeps when idle, and its local disk is wiped on each deploy, so use Postgres and Supabase Storage rather than SQLite and local media.
 
-Suggested flow:
-1. Push this repo to GitHub.
-2. In Render, create a new Blueprint and select this repo.
-3. Deploy the resources from `render.yaml`.
-4. After deploy, create your first admin user from the Render shell or a one-off command:
-
-```bash
-python manage.py createsuperuser
-```
-
-5. Point the frontend API base to your Render backend URL:
+Point the frontend at the API with:
 
 ```env
 VITE_DJANGO_API_BASE=https://your-render-service.onrender.com/api
 VITE_USE_DJANGO_API=true
 ```
-
-## Push backend to a separate repository
-
-If you want backend isolated in its own repo, run:
-
-```bash
-git subtree split --prefix backend -b backend-only
-git init ../bilta-backend
-cd ../bilta-backend
-git pull ../bilta backend-only
-git remote add origin https://github.com/<your-username>/<your-backend-repo>.git
-git push -u origin main
-```
-
-If you also want `crm`, `manage.py`, `.env.example`, `requirements.txt`, and `Procfile` in that repo, I can do the clean extraction workflow next.

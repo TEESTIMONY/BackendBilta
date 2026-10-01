@@ -31,3 +31,16 @@ media
 # requirements.txt
 # Procfile
 # db.sqlite3
+
+# Python / Django
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+db.sqlite3
+staticfiles/
+
+# Secrets
+.env
+.env.*
+!.env.example

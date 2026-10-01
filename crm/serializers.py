@@ -2,6 +2,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.core import signing
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from django.utils import timezone
@@ -27,18 +28,23 @@ from .models import (
 
 User = get_user_model()
 
+ATTACHMENT_LINK_SALT = 'crm.job-attachment-download'
+ATTACHMENT_LINK_MAX_AGE_SECONDS = 12 * 60 * 60
+
+# The Naira sign, its UTF-8-read-as-cp1252 mojibake, and currency codes clients may send.
+CURRENCY_MARKERS = ('₦', 'â‚¦', 'NGN', 'N')
+
 
 def parse_public_money(value):
     raw = str(value or '').strip()
     if not raw:
         return Decimal('0.00')
 
-    cleaned = (
-        raw.replace('₦', '')
-        .replace('₦', '')
-        .replace(',', '')
-        .replace(' ', '')
-    )
+    cleaned = raw.replace(',', '').replace(' ', '')
+    for marker in CURRENCY_MARKERS:
+        if cleaned.upper().startswith(marker.upper()):
+            cleaned = cleaned[len(marker):]
+            break
     try:
         amount = Decimal(cleaned)
     except (InvalidOperation, ValueError):
@@ -81,15 +87,18 @@ def resolve_public_customer(*, full_name, phone='', email='', address='', custom
             notes=str(customer_note or '').strip(),
         )
 
+    # Public submissions are unauthenticated, so they may only fill gaps in an existing
+    # record, never overwrite details staff already hold. What the visitor typed is kept
+    # on the job itself.
     changed_fields = []
 
-    if normalized_name and customer.full_name != normalized_name:
+    if normalized_name and not customer.full_name:
         customer.full_name = normalized_name
         changed_fields.append('full_name')
-    if normalized_phone and customer.phone != normalized_phone:
+    if normalized_phone and not customer.phone:
         customer.phone = normalized_phone
         changed_fields.append('phone')
-    if normalized_email and customer.email != normalized_email:
+    if normalized_email and not customer.email:
         customer.email = normalized_email
         changed_fields.append('email')
     if address and not customer.address:
@@ -197,10 +206,12 @@ class JobAttachmentSerializer(serializers.ModelSerializer):
         fields = ('id', 'original_name', 'content_type', 'size_bytes', 'created_at', 'download_url')
 
     def get_download_url(self, obj):
+        signature = signing.TimestampSigner(salt=ATTACHMENT_LINK_SALT).sign(str(obj.id))
+        path = f'/api/job-attachments/{obj.id}/download/?sig={signature}'
         request = self.context.get('request')
         if not request:
-            return f'/api/job-attachments/{obj.id}/download/'
-        return request.build_absolute_uri(f'/api/job-attachments/{obj.id}/download/')
+            return path
+        return request.build_absolute_uri(path)
 
 
 class JobSerializer(serializers.ModelSerializer):
@@ -211,19 +222,48 @@ class JobSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     status_history = JobStatusHistorySerializer(many=True, read_only=True)
     attachments = JobAttachmentSerializer(many=True, read_only=True)
+    amount_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model = Job
         fields = '__all__'
-        read_only_fields = ('total', 'balance_due', 'payment_status')
+        # Discounts are only applied through a payment (see PaymentRecordSerializer.agreed_total)
+        # so each one is logged with who gave it.
+        read_only_fields = ('total', 'balance_due', 'payment_status', 'discount_amount', 'discount_reason')
 
 
 class PaymentRecordSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.CharField(source='recorded_by.username', read_only=True)
+    # Optional: the price agreed with the customer for the linked job. The difference from
+    # the job's total is saved as a discount before this payment is applied.
+    agreed_total = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.00'), required=False, allow_null=True, write_only=True
+    )
+    discount_reason = serializers.CharField(required=False, allow_blank=True, write_only=True)
 
     class Meta:
         model = PaymentRecord
         fields = '__all__'
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        agreed_total = attrs.get('agreed_total')
+        if agreed_total is None:
+            return attrs
+        if self.instance is not None:
+            raise serializers.ValidationError({'agreed_total': 'Discounts can only be given with a new payment.'})
+        job = attrs.get('job')
+        if not job:
+            raise serializers.ValidationError({'agreed_total': 'Choose a job to apply a discount to.'})
+        if agreed_total > job.total:
+            raise serializers.ValidationError(
+                {'agreed_total': f'The agreed price cannot be more than the job total ({job.total}).'}
+            )
+        if agreed_total < job.amount_paid:
+            raise serializers.ValidationError(
+                {'agreed_total': f'The agreed price cannot be less than what was already paid ({job.amount_paid}).'}
+            )
+        return attrs
 
 
 class PhotocopySessionSerializer(serializers.ModelSerializer):
@@ -585,11 +625,16 @@ class PublicCheckoutRequestSerializer(serializers.Serializer):
             parse_public_money(item.get('price')) * Decimal(int(item.get('quantity') or 1))
             for item in items
         )
-        unit_price = (
-            (subtotal / Decimal(total_quantity)).quantize(Decimal('0.01'))
-            if total_quantity and subtotal > Decimal('0.00')
-            else Decimal('0.00')
-        )
+        # Job.total is always quantity * unit_price. When the subtotal doesn't split evenly
+        # across the quantity, record it as a single line so the total isn't rounded off;
+        # per-item quantities are still listed in project_scope_note.
+        job_quantity = total_quantity
+        unit_price = Decimal('0.00')
+        if total_quantity and subtotal > Decimal('0.00'):
+            unit_price = (subtotal / Decimal(total_quantity)).quantize(Decimal('0.01'))
+            if unit_price * Decimal(total_quantity) != subtotal:
+                job_quantity = 1
+                unit_price = subtotal
 
         item_lines = []
         for item in items:
@@ -604,6 +649,7 @@ class PublicCheckoutRequestSerializer(serializers.Serializer):
 
         note_lines = [
             'Website checkout order.',
+            f'Name: {full_name}',
             f"Country: {validated_data['country']}",
             f"Address: {validated_data['street_address']}",
             f"Phone: {validated_data['phone']}",
@@ -620,7 +666,7 @@ class PublicCheckoutRequestSerializer(serializers.Serializer):
                 if len(items) == 1
                 else f"Website order with {len(items)} items"
             ),
-            quantity=total_quantity,
+            quantity=job_quantity,
             unit_price=unit_price,
             special_instructions='\n'.join(note_lines),
             project_scope_note='Items:\n' + '\n'.join(f"- {line}" for line in item_lines),
@@ -663,6 +709,7 @@ class PublicDesignRequestSerializer(serializers.Serializer):
 
         detail_lines = [
             'Website design request.',
+            f"Name: {validated_data['full_name'].strip()}",
             f"Phone: {validated_data['phone']}",
             f"Email: {validated_data['email']}",
         ]

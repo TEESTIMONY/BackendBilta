@@ -238,15 +238,34 @@ class Job(TimeStampedModel):
     status = models.CharField(max_length=25, choices=JobStatus.choices, default=JobStatus.PENDING)
     payment_status = models.CharField(max_length=20, choices=PaymentStatus.choices, default=PaymentStatus.UNPAID)
     amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    # Agreed reduction off `total` (e.g. bulk or goodwill discount given when collecting payment).
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    discount_reason = models.TextField(blank=True)
     balance_due = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
 
     class Meta:
         ordering = ['deadline', '-created_at']
 
+    @property
+    def amount_due(self):
+        """What the customer has agreed to pay: total less any discount."""
+        return max(Decimal('0.00'), self.total - self.discount_amount)
+
     def save(self, *args, **kwargs):
+        # Values may arrive as strings or ints (e.g. Job.objects.create(unit_price='10.00')).
+        self.quantity = int(self.quantity)
+        self.unit_price = Decimal(str(self.unit_price or '0'))
+        self.amount_paid = Decimal(str(self.amount_paid or '0'))
+        self.discount_amount = max(
+            Decimal('0.00'),
+            min(Decimal(str(self.discount_amount or '0')), Decimal(self.quantity) * self.unit_price),
+        )
         self.total = Decimal(self.quantity) * self.unit_price
-        self.balance_due = max(Decimal('0.00'), self.total - self.amount_paid)
-        if self.balance_due == Decimal('0.00'):
+        self.balance_due = max(Decimal('0.00'), self.amount_due - self.amount_paid)
+        if self.total == Decimal('0.00') and self.amount_paid == Decimal('0.00'):
+            # Nothing priced yet (e.g. website requests awaiting a quote): not paid.
+            self.payment_status = self.PaymentStatus.UNPAID
+        elif self.balance_due == Decimal('0.00'):
             self.payment_status = self.PaymentStatus.PAID
         elif self.amount_paid > Decimal('0.00'):
             self.payment_status = self.PaymentStatus.PARTIAL
