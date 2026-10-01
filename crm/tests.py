@@ -814,3 +814,97 @@ class ApiSmokeTests(APITestCase):
         job.refresh_from_db()
         self.assertEqual(job.discount_amount, Decimal('2000.00'))
         self.assertEqual(job.balance_due, Decimal('2000.00'))
+
+    def test_walk_in_job_with_several_items_and_a_discount(self):
+        response = self.staff_client.post(
+            '/api/jobs/',
+            {
+                'customer': self.customer.id,
+                'job_type': 'walk_in',
+                'fulfilment': 'delivery',
+                'items': [
+                    {'description': 'A4 flyers, full colour', 'quantity': 50, 'rate': '150.00'},
+                    {'description': 'Roll-up banner', 'quantity': 2, 'rate': '25000.00'},
+                    {'description': 'Lamination A4', 'quantity': 10, 'rate': '300.00'},
+                ],
+                'agreed_total': '60000.00',
+                'discount_reason': 'Regular customer',
+                'amount_paid': '20000.00',
+                'special_instructions': 'Deliver to the office',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        job = Job.objects.get(id=response.data['id'])
+
+        self.assertEqual(job.items.count(), 3)
+        self.assertEqual(job.total, Decimal('60500.00'))
+        self.assertEqual(job.discount_amount, Decimal('500.00'))
+        self.assertEqual(job.amount_due, Decimal('60000.00'))
+        self.assertEqual(job.balance_due, Decimal('40000.00'))
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PARTIAL)
+        self.assertEqual(job.fulfilment, 'delivery')
+        self.assertIn('Roll-up banner x2', job.description)
+        self.assertEqual([i['amount'] for i in response.data['items']], ['7500.00', '50000.00', '3000.00'])
+
+        self.assertEqual(
+            [p.amount for p in PaymentRecord.objects.filter(job=job)], [Decimal('20000.00')]
+        )
+        audit = AuditLog.objects.get(action='discount', object_id=str(job.id))
+        self.assertEqual(audit.performed_by, self.staff)
+        self.assertEqual(audit.reason, 'Regular customer')
+
+        # Staff can't change the items afterwards; the owner can, and the total follows.
+        blocked = self.staff_client.patch(
+            f'/api/jobs/{job.id}/', {'items': [{'description': 'x', 'quantity': 1, 'rate': '1.00'}]}, format='json'
+        )
+        self.assertEqual(blocked.status_code, 400)
+        self.owner_client.patch(
+            f'/api/jobs/{job.id}/',
+            {'items': [{'description': 'A4 flyers, full colour', 'quantity': 100, 'rate': '150.00'}]},
+            format='json',
+        )
+        job.refresh_from_db()
+        self.assertEqual(job.total, Decimal('15000.00'))
+        self.assertEqual(job.balance_due, Decimal('0.00'))  # 15,000 - 500 discount - 20,000 paid
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PAID)
+
+    def test_job_item_and_discount_validation(self):
+        def create(**payload):
+            return self.staff_client.post(
+                '/api/jobs/', {'customer': self.customer.id, 'job_type': 'walk_in', **payload}, format='json'
+            )
+
+        self.assertEqual(create(items=[]).status_code, 400)
+        self.assertEqual(create(items=[{'description': 'Cards', 'quantity': 0, 'rate': '10.00'}]).status_code, 400)
+        self.assertEqual(create(items=[{'description': 'Cards', 'quantity': 1, 'rate': '-5.00'}]).status_code, 400)
+        one_item = [{'description': 'Cards', 'quantity': 2, 'rate': '5000.00'}]
+        self.assertEqual(create(items=one_item, agreed_total='12000.00').status_code, 400)  # above total
+        self.assertEqual(create(items=one_item, agreed_total='4000.00', amount_paid='5000.00').status_code, 400)
+        ok = create(items=one_item, agreed_total='9000.00')
+        self.assertEqual(ok.status_code, 201, ok.data)
+        self.assertEqual(Job.objects.get(id=ok.data['id']).payment_status, Job.PaymentStatus.UNPAID)
+
+    def test_website_checkout_saves_cart_lines_as_job_items(self):
+        response = self.client.post(
+            '/api/public/order-requests/checkout/',
+            {
+                'first_name': 'Item',
+                'last_name': 'Buyer',
+                'country': 'Nigeria',
+                'street_address': '4 Street',
+                'phone': '08014141414',
+                'email': 'item-buyer@example.com',
+                'items': [
+                    {'title': 'Business cards', 'price': '\u20a612,000', 'quantity': 1},
+                    {'title': 'Flyers', 'price': '\u20a6333', 'quantity': 3},
+                    {'title': 'Banner', 'price': 'Price on request', 'quantity': 1},
+                ],
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        job = Job.objects.get(id=response.data['job_id'])
+        self.assertEqual(list(job.items.values_list('description', 'quantity')), [('Business cards', 1), ('Flyers', 3), ('Banner', 1)])
+        self.assertEqual(job.total, Decimal('12999.00'))
+        self.assertEqual(job.payment_status, Job.PaymentStatus.UNPAID)

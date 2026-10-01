@@ -300,7 +300,7 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
 
 
 class JobViewSet(viewsets.ModelViewSet):
-    queryset = Job.objects.all().select_related('customer', 'created_by', 'updated_by').prefetch_related('status_history', 'attachments')
+    queryset = Job.objects.all().select_related('customer', 'created_by', 'updated_by').prefetch_related('status_history', 'attachments', 'items')
     serializer_class = JobSerializer
     search_fields = ['customer__full_name', 'job_type', 'description', 'special_instructions']
     ordering_fields = ['created_at', 'deadline', 'updated_at', 'total']
@@ -323,6 +323,9 @@ class JobViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             job = serializer.save(created_by=self.request.user if self.request.user.is_authenticated else None)
             self._log_amount_paid_change(job, job.amount_paid, 'Paid when the job was created.')
+        discount = getattr(serializer, 'applied_discount', None)
+        if discount:
+            write_audit('discount', 'Job', job.id, self.request.user, reason=job.discount_reason, metadata=discount)
         job.customer.last_job_date = timezone.now()
         job.customer.save(update_fields=['last_job_date', 'updated_at'])
         JobStatusHistory.objects.create(job=job, from_status='', to_status=job.status, changed_by=self.request.user if self.request.user.is_authenticated else None)
@@ -331,7 +334,7 @@ class JobViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         previous = self.get_object()
         if not is_owner_user(self.request.user):
-            protected_fields = {'unit_price', 'quantity', 'amount_paid'}
+            protected_fields = {'unit_price', 'quantity', 'amount_paid', 'items'}
             attempted = protected_fields.intersection(set(self.request.data.keys()))
             if attempted:
                 raise serializers.ValidationError(

@@ -14,6 +14,7 @@ from .models import (
     Customer,
     Job,
     JobAttachment,
+    JobItem,
     JobStatusHistory,
     MessageTemplate,
     Order,
@@ -214,6 +215,19 @@ class JobAttachmentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(path)
 
 
+class JobItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobItem
+        fields = ('id', 'description', 'quantity', 'rate', 'amount')
+        read_only_fields = ('id', 'amount')
+        extra_kwargs = {'quantity': {'min_value': 1}, 'rate': {'min_value': Decimal('0.00')}}
+
+
+def summarize_items(items):
+    lines = [f"{item['description']} x{item['quantity']}" for item in items]
+    return ', '.join(lines)[:500]
+
+
 class JobSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(source='customer.full_name', read_only=True)
     customer_phone = serializers.CharField(source='customer.phone', read_only=True)
@@ -223,13 +237,78 @@ class JobSerializer(serializers.ModelSerializer):
     status_history = JobStatusHistorySerializer(many=True, read_only=True)
     attachments = JobAttachmentSerializer(many=True, read_only=True)
     amount_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    items = JobItemSerializer(many=True, required=False)
+    # Optional on create: the price agreed with the customer. The difference from the items'
+    # total becomes a discount, logged with who gave it (same rule as discounts on payments).
+    agreed_total = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.00'), required=False, allow_null=True, write_only=True
+    )
+    discount_reason = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = Job
         fields = '__all__'
-        # Discounts are only applied through a payment (see PaymentRecordSerializer.agreed_total)
-        # so each one is logged with who gave it.
-        read_only_fields = ('total', 'balance_due', 'payment_status', 'discount_amount', 'discount_reason')
+        read_only_fields = ('total', 'balance_due', 'payment_status', 'discount_amount')
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        items = attrs.get('items')
+        if items is not None and self.instance is None and not items and 'unit_price' not in attrs:
+            raise serializers.ValidationError({'items': 'Add at least one item.'})
+        agreed_total = attrs.get('agreed_total')
+        if agreed_total is not None:
+            if self.instance is not None:
+                raise serializers.ValidationError(
+                    {'agreed_total': 'Give a discount while recording a payment for an existing job.'}
+                )
+            if items:
+                gross = sum(Decimal(item['quantity']) * item['rate'] for item in items)
+            else:
+                gross = Decimal(attrs.get('quantity') or 1) * Decimal(attrs.get('unit_price') or 0)
+            paid = Decimal(attrs.get('amount_paid') or 0)
+            if agreed_total > gross:
+                raise serializers.ValidationError(
+                    {'agreed_total': f'The discounted price cannot be more than the total ({gross}).'}
+                )
+            if agreed_total < paid:
+                raise serializers.ValidationError(
+                    {'agreed_total': f'The discounted price cannot be less than the amount paid ({paid}).'}
+                )
+        return attrs
+
+    def create(self, validated_data):
+        items = validated_data.pop('items', None) or []
+        agreed_total = validated_data.pop('agreed_total', None)
+        discount_reason = str(validated_data.pop('discount_reason', '') or '').strip()
+        if items and not validated_data.get('description'):
+            validated_data['description'] = summarize_items(items)
+
+        job = Job.objects.create(**validated_data)
+        for item in items:
+            JobItem.objects.create(job=job, **item)
+        if agreed_total is not None:
+            job.save()  # pick up the items' total first
+            job.discount_amount = job.total - agreed_total
+            job.discount_reason = discount_reason
+        job.save()
+        self.applied_discount = (
+            {'total': str(job.total), 'agreed_total': str(agreed_total), 'discount_amount': str(job.discount_amount)}
+            if agreed_total is not None and job.discount_amount
+            else None
+        )
+        return job
+
+    def update(self, instance, validated_data):
+        items = validated_data.pop('items', None)
+        validated_data.pop('agreed_total', None)
+        validated_data.pop('discount_reason', None)
+        job = super().update(instance, validated_data)
+        if items is not None:
+            job.items.all().delete()
+            for item in items:
+                JobItem.objects.create(job=job, **item)
+            job.save()
+        return job
 
 
 class PaymentRecordSerializer(serializers.ModelSerializer):
@@ -621,20 +700,6 @@ class PublicCheckoutRequestSerializer(serializers.Serializer):
         )
 
         total_quantity = sum(int(item.get('quantity') or 1) for item in items)
-        subtotal = sum(
-            parse_public_money(item.get('price')) * Decimal(int(item.get('quantity') or 1))
-            for item in items
-        )
-        # Job.total is always quantity * unit_price. When the subtotal doesn't split evenly
-        # across the quantity, record it as a single line so the total isn't rounded off;
-        # per-item quantities are still listed in project_scope_note.
-        job_quantity = total_quantity
-        unit_price = Decimal('0.00')
-        if total_quantity and subtotal > Decimal('0.00'):
-            unit_price = (subtotal / Decimal(total_quantity)).quantize(Decimal('0.01'))
-            if unit_price * Decimal(total_quantity) != subtotal:
-                job_quantity = 1
-                unit_price = subtotal
 
         item_lines = []
         for item in items:
@@ -658,7 +723,7 @@ class PublicCheckoutRequestSerializer(serializers.Serializer):
         if validated_data.get('additional_note'):
             note_lines.append(f"Customer note: {validated_data['additional_note']}")
 
-        return Job.objects.create(
+        job = Job.objects.create(
             customer=customer,
             job_type='printing',
             description=(
@@ -666,13 +731,21 @@ class PublicCheckoutRequestSerializer(serializers.Serializer):
                 if len(items) == 1
                 else f"Website order with {len(items)} items"
             ),
-            quantity=job_quantity,
-            unit_price=unit_price,
+            quantity=total_quantity,
             special_instructions='\n'.join(note_lines),
             project_scope_note='Items:\n' + '\n'.join(f"- {line}" for line in item_lines),
             status=Job.JobStatus.PENDING,
             amount_paid=Decimal('0.00'),
         )
+        for item in items:
+            JobItem.objects.create(
+                job=job,
+                description=str(item['title'])[:255],
+                quantity=int(item.get('quantity') or 1),
+                rate=parse_public_money(item.get('price')),
+            )
+        job.save()  # total = sum of the items
+        return job
 
 
 class PublicDesignRequestSerializer(serializers.Serializer):
