@@ -915,3 +915,42 @@ class ApiSmokeTests(APITestCase):
         row = self.staff_client.get(f'/api/customers/{self.customer.id}/').data
         self.assertEqual(row['orders_count'], 2)
         self.assertTrue(row['is_returning_customer'])
+
+    def test_reports_get_detailed_activity_for_one_day(self):
+        job = self.staff_client.post(
+            '/api/jobs/',
+            {
+                'customer': self.customer.id,
+                'job_type': 'walk_in',
+                'items': [{'description': 'Flyers', 'quantity': 10, 'rate': '100.00'}],
+            },
+            format='json',
+        ).data
+        self.staff_client.patch(f"/api/jobs/{job['id']}/", {'status': 'completed'}, format='json')
+        payment = self.staff_client.post(
+            '/api/payments/', {'job': job['id'], 'amount': '600.00', 'source': 'job'}, format='json'
+        ).data
+        self.owner_client.patch(
+            f"/api/payments/{payment['id']}/", {'amount': '700.00', 'edit_reason': 'Miscounted'}, format='json'
+        )
+
+        today = timezone.localdate()
+        rows = self.owner_client.get(f'/api/audit-logs/?date={today}').data['results']
+        by_kind = {(r['model_name'], r['action']): r for r in rows}
+
+        created = by_kind[('Job', 'create')]['metadata']
+        self.assertEqual((created['customer_name'], created['total']), ('API Customer', '1000.00'))
+        moved = by_kind[('Job', 'update')]['metadata']
+        self.assertEqual((moved['status_from'], moved['status_to']), ('pending', 'completed'))
+        paid = by_kind[('PaymentRecord', 'create')]['metadata']
+        self.assertEqual((paid['amount'], paid['job_id']), ('600.00', job['id']))
+        edited = by_kind[('PaymentRecord', 'update')]
+        self.assertEqual((edited['metadata']['amount_from'], edited['metadata']['amount'], edited['reason']), ('600.00', '700.00', 'Miscounted'))
+        self.assertEqual(by_kind[('Job', 'create')]['performed_by_display'], 'API Staff')
+
+        # Other days are excluded, and bad dates are rejected.
+        yesterday = today - timedelta(days=1)
+        self.assertEqual(self.owner_client.get(f'/api/audit-logs/?date={yesterday}').data['results'], [])
+        self.assertEqual(self.owner_client.get('/api/audit-logs/?date=nope').status_code, 400)
+        self.assertEqual(len(self.staff_client.get(f'/api/payments/?date={today}').data['results']), 1)
+        self.assertEqual(self.staff_client.get(f'/api/payments/?date={yesterday}').data['results'], [])

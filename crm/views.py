@@ -123,6 +123,21 @@ def write_audit(action, model_name, object_id='', user=None, reason='', metadata
     )
 
 
+class OneDayFilterMixin:
+    """`?date=YYYY-MM-DD` limits a history list to records created that day (Africa/Lagos)."""
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        date_value = self.request.query_params.get('date')
+        if date_value:
+            queryset = queryset.filter(created_at__date=parse_date_param(date_value, 'date'))
+        return queryset
+
+
+def money(value):
+    return str(value if value is not None else '0.00')
+
+
 def parse_date_param(value, name):
     try:
         return datetime.strptime(value, '%Y-%m-%d').date()
@@ -187,11 +202,11 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         customer = serializer.save()
-        write_audit('create', 'Customer', customer.id, self.request.user)
+        write_audit('create', 'Customer', customer.id, self.request.user, metadata={'name': customer.full_name})
 
     def perform_update(self, serializer):
         customer = serializer.save()
-        write_audit('update', 'Customer', customer.id, self.request.user)
+        write_audit('update', 'Customer', customer.id, self.request.user, metadata={'name': customer.full_name})
 
 
 class OrderViewSet(viewsets.ModelViewSet):
@@ -329,7 +344,13 @@ class JobViewSet(viewsets.ModelViewSet):
         job.customer.last_job_date = timezone.now()
         job.customer.save(update_fields=['last_job_date', 'updated_at'])
         JobStatusHistory.objects.create(job=job, from_status='', to_status=job.status, changed_by=self.request.user if self.request.user.is_authenticated else None)
-        write_audit('create', 'Job', job.id, self.request.user)
+        write_audit(
+            'create',
+            'Job',
+            job.id,
+            self.request.user,
+            metadata={'customer_name': job.customer.full_name, 'total': money(job.amount_due), 'paid': money(job.amount_paid)},
+        )
 
     def perform_update(self, serializer):
         previous = self.get_object()
@@ -355,7 +376,12 @@ class JobViewSet(viewsets.ModelViewSet):
         job.customer.save(update_fields=['last_job_date', 'updated_at'])
         if old_status != job.status:
             JobStatusHistory.objects.create(job=job, from_status=old_status, to_status=job.status, changed_by=self.request.user if self.request.user.is_authenticated else None)
-        write_audit('update', 'Job', job.id, self.request.user)
+        changes = {'customer_name': job.customer.full_name}
+        if old_status != job.status:
+            changes.update({'status_from': old_status, 'status_to': job.status})
+        if old_amount_paid != job.amount_paid:
+            changes.update({'paid_from': money(old_amount_paid), 'paid_to': money(job.amount_paid)})
+        write_audit('update', 'Job', job.id, self.request.user, metadata=changes)
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -383,7 +409,7 @@ class JobViewSet(viewsets.ModelViewSet):
         return response.Response(data)
 
 
-class PaymentRecordViewSet(viewsets.ModelViewSet):
+class PaymentRecordViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
     queryset = PaymentRecord.objects.all().select_related('job', 'recorded_by')
     serializer_class = PaymentRecordSerializer
     search_fields = ['service_label', 'job__job_type', 'job__customer__full_name']
@@ -420,7 +446,7 @@ class PaymentRecordViewSet(viewsets.ModelViewSet):
             self._adjust_job_paid(payment.job_id, payment.amount)
         if discount:
             write_audit('discount', 'Job', discount['job_id'], self.request.user, reason=discount_reason, metadata=discount)
-        write_audit('create', 'PaymentRecord', payment.id, self.request.user)
+        write_audit('create', 'PaymentRecord', payment.id, self.request.user, metadata=payment_details(payment))
 
     def perform_update(self, serializer):
         reason = str(self.request.data.get('edit_reason', '') or '').strip()
@@ -435,17 +461,35 @@ class PaymentRecordViewSet(viewsets.ModelViewSet):
             else:
                 self._adjust_job_paid(old_job_id, -old_amount)
                 self._adjust_job_paid(payment.job_id, payment.amount)
-        write_audit('update', 'PaymentRecord', payment.id, self.request.user, reason=reason)
+        write_audit(
+            'update',
+            'PaymentRecord',
+            payment.id,
+            self.request.user,
+            reason=reason,
+            metadata={**payment_details(payment), 'amount_from': money(old_amount)},
+        )
 
     def perform_destroy(self, instance):
         payment_id = instance.id
+        details = payment_details(instance)
         with transaction.atomic():
             self._adjust_job_paid(instance.job_id, -instance.amount)
             instance.delete()
-        write_audit('delete', 'PaymentRecord', payment_id, self.request.user)
+        write_audit('delete', 'PaymentRecord', payment_id, self.request.user, metadata=details)
 
 
-class PhotocopySessionViewSet(viewsets.ModelViewSet):
+def payment_details(payment):
+    return {
+        'amount': money(payment.amount),
+        'job_id': payment.job_id,
+        'source': payment.source,
+        'service_label': payment.service_label,
+        'customer_name': payment.job.customer.full_name if payment.job_id else '',
+    }
+
+
+class PhotocopySessionViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
     queryset = PhotocopySession.objects.all().select_related('staff')
     serializer_class = PhotocopySessionSerializer
     ordering_fields = ['created_at', 'updated_at', 'expected_revenue', 'actual_cash_collected']
@@ -453,10 +497,21 @@ class PhotocopySessionViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         session = serializer.save(staff=self.request.user if self.request.user.is_authenticated else None)
-        write_audit('create', 'PhotocopySession', session.id, self.request.user)
+        write_audit(
+            'create',
+            'PhotocopySession',
+            session.id,
+            self.request.user,
+            metadata={
+                'copies': session.total_copies,
+                'expected': money(session.expected_revenue),
+                'collected': money(session.actual_cash_collected),
+                'gap': money(session.revenue_gap),
+            },
+        )
 
 
-class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+class AuditLogViewSet(OneDayFilterMixin, viewsets.ReadOnlyModelViewSet):
     queryset = AuditLog.objects.all().select_related('performed_by')
     serializer_class = AuditLogSerializer
     search_fields = ['action', 'model_name', 'performed_by__username']

@@ -29,6 +29,13 @@ from .models import (
 
 User = get_user_model()
 
+
+def person_name(user):
+    """A person's full name for display, falling back to their username."""
+    if not user:
+        return ''
+    return f'{user.first_name} {user.last_name}'.strip() or user.username
+
 ATTACHMENT_LINK_SALT = 'crm.job-attachment-download'
 ATTACHMENT_LINK_MAX_AGE_SECONDS = 12 * 60 * 60
 
@@ -312,7 +319,11 @@ class JobSerializer(serializers.ModelSerializer):
 
 
 class PaymentRecordSerializer(serializers.ModelSerializer):
-    recorded_by_name = serializers.CharField(source='recorded_by.username', read_only=True)
+    recorded_by_name = serializers.SerializerMethodField()
+
+    def get_recorded_by_name(self, obj):
+        return person_name(obj.recorded_by)
+
     # Optional: the price agreed with the customer for the linked job. The difference from
     # the job's total is saved as a discount before this payment is applied.
     agreed_total = serializers.DecimalField(
@@ -346,7 +357,11 @@ class PaymentRecordSerializer(serializers.ModelSerializer):
 
 
 class PhotocopySessionSerializer(serializers.ModelSerializer):
-    staff_name = serializers.CharField(source='staff.username', read_only=True)
+    staff_name = serializers.SerializerMethodField()
+
+    def get_staff_name(self, obj):
+        return person_name(obj.staff)
+
 
     class Meta:
         model = PhotocopySession
@@ -356,6 +371,10 @@ class PhotocopySessionSerializer(serializers.ModelSerializer):
 
 class AuditLogSerializer(serializers.ModelSerializer):
     performed_by_name = serializers.CharField(source='performed_by.username', read_only=True)
+    performed_by_display = serializers.SerializerMethodField()
+
+    def get_performed_by_display(self, obj):
+        return person_name(obj.performed_by) or 'Website'
 
     class Meta:
         model = AuditLog
