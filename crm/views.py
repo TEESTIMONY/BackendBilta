@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import update_last_login
 from django.core import signing
 from django.db import transaction
 from django.http import FileResponse
@@ -592,6 +593,7 @@ def auth_login(request):
     serializer.is_valid(raise_exception=True)
     user = serializer.validated_data['user']
     token, _ = Token.objects.get_or_create(user=user)
+    update_last_login(None, user)
     return response.Response(
         {
             'token': token.key,

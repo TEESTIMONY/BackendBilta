@@ -297,6 +297,8 @@ class ApiSmokeTests(APITestCase):
         )
         self.assertEqual(response.status_code, 200, response.data)
         token = response.data['token']
+        self.owner.refresh_from_db()
+        self.assertIsNotNone(self.owner.last_login)
 
         token_client = APIClient()
         token_client.credentials(HTTP_AUTHORIZATION=f'Token {token}')
