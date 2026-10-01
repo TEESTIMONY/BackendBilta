@@ -908,3 +908,10 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(list(job.items.values_list('description', 'quantity')), [('Business cards', 1), ('Flyers', 3), ('Banner', 1)])
         self.assertEqual(job.total, Decimal('12999.00'))
         self.assertEqual(job.payment_status, Job.PaymentStatus.UNPAID)
+
+    def test_customer_job_count(self):
+        for _ in range(2):
+            Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('100.00'))
+        row = self.staff_client.get(f'/api/customers/{self.customer.id}/').data
+        self.assertEqual(row['orders_count'], 2)
+        self.assertTrue(row['is_returning_customer'])

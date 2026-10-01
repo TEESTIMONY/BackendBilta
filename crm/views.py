@@ -179,7 +179,7 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 
 class CustomerViewSet(viewsets.ModelViewSet):
-    queryset = Customer.objects.all().prefetch_related('orders')
+    queryset = Customer.objects.all().prefetch_related('jobs')
     serializer_class = CustomerSerializer
     search_fields = ['full_name', 'phone', 'email', 'city']
     ordering_fields = ['full_name', 'created_at', 'updated_at']

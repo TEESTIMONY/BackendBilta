@@ -71,7 +71,8 @@ class Customer(TimeStampedModel):
 
     @property
     def orders_count(self):
-        return self.orders.count()
+        # Jobs are the shop's orders (the old Order records are no longer created).
+        return self.jobs.count()
 
     @property
     def is_returning_customer(self):
