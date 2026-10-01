@@ -4,6 +4,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.db import models
+from django.db.models import Sum
 from django.utils import timezone
 
 
@@ -70,7 +71,8 @@ class Customer(TimeStampedModel):
 
     @property
     def orders_count(self):
-        return self.orders.count()
+        # Jobs are the shop's orders (the old Order records are no longer created).
+        return self.jobs.count()
 
     @property
     def is_returning_customer(self):
@@ -224,6 +226,10 @@ class Job(TimeStampedModel):
         PARTIAL = 'partial', 'Partially Paid'
         PAID = 'paid', 'Paid'
 
+    class Fulfilment(models.TextChoices):
+        PICKUP = 'pickup', 'Pickup'
+        DELIVERY = 'delivery', 'Delivery'
+
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name='jobs')
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='jobs_created')
     updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='jobs_updated')
@@ -233,6 +239,7 @@ class Job(TimeStampedModel):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
     total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
     deadline = models.DateTimeField(null=True, blank=True)
+    fulfilment = models.CharField(max_length=20, choices=Fulfilment.choices, default=Fulfilment.PICKUP)
     special_instructions = models.TextField(blank=True)
     project_scope_note = models.TextField(blank=True)
     status = models.CharField(max_length=25, choices=JobStatus.choices, default=JobStatus.PENDING)
@@ -251,16 +258,23 @@ class Job(TimeStampedModel):
         """What the customer has agreed to pay: total less any discount."""
         return max(Decimal('0.00'), self.total - self.discount_amount)
 
+    def items_total(self):
+        """Sum of this job's line items, or None for single-price jobs without items."""
+        if not self.pk or not self.items.exists():
+            return None
+        return self.items.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
     def save(self, *args, **kwargs):
         # Values may arrive as strings or ints (e.g. Job.objects.create(unit_price='10.00')).
         self.quantity = int(self.quantity)
         self.unit_price = Decimal(str(self.unit_price or '0'))
         self.amount_paid = Decimal(str(self.amount_paid or '0'))
+        items_total = self.items_total()
+        self.total = items_total if items_total is not None else Decimal(self.quantity) * self.unit_price
         self.discount_amount = max(
             Decimal('0.00'),
-            min(Decimal(str(self.discount_amount or '0')), Decimal(self.quantity) * self.unit_price),
+            min(Decimal(str(self.discount_amount or '0')), self.total),
         )
-        self.total = Decimal(self.quantity) * self.unit_price
         self.balance_due = max(Decimal('0.00'), self.amount_due - self.amount_paid)
         if self.total == Decimal('0.00') and self.amount_paid == Decimal('0.00'):
             # Nothing priced yet (e.g. website requests awaiting a quote): not paid.
@@ -275,6 +289,28 @@ class Job(TimeStampedModel):
 
     def __str__(self):
         return f'JOB-{self.id} {self.job_type}'
+
+
+class JobItem(TimeStampedModel):
+    """One row of a job, like a line on the paper Job Order Form."""
+
+    job = models.ForeignKey(Job, on_delete=models.CASCADE, related_name='items')
+    description = models.CharField(max_length=255)
+    quantity = models.PositiveIntegerField(default=1)
+    rate = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+
+    class Meta:
+        ordering = ['id']
+
+    def save(self, *args, **kwargs):
+        self.quantity = int(self.quantity)
+        self.rate = Decimal(str(self.rate or '0'))
+        self.amount = Decimal(self.quantity) * self.rate
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.description} x{self.quantity}'
 
 
 class JobAttachment(TimeStampedModel):
