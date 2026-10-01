@@ -737,3 +737,80 @@ class ApiSmokeTests(APITestCase):
         # Daily revenue now matches what the jobs say was collected.
         summary = self.staff_client.get('/api/reports/daily-summary/').data
         self.assertEqual(Decimal(str(summary['total_revenue'])), job.amount_paid)
+
+    def test_discounted_payment_closes_the_job(self):
+        job = Job.objects.create(
+            customer=self.customer, job_type='printing', quantity=35, unit_price=Decimal('1000.00')
+        )
+        self.assertEqual(job.total, Decimal('35000.00'))
+
+        # Staff collect N30,000 against an agreed discounted price of N30,000.
+        response = self.staff_client.post(
+            '/api/payments/',
+            {
+                'job': job.id,
+                'amount': '30000.00',
+                'source': 'job',
+                'agreed_total': '30000.00',
+                'discount_reason': 'Bulk order discount',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertNotIn('agreed_total', response.data)
+
+        job.refresh_from_db()
+        self.assertEqual(job.total, Decimal('35000.00'))
+        self.assertEqual(job.discount_amount, Decimal('5000.00'))
+        self.assertEqual(job.discount_reason, 'Bulk order discount')
+        self.assertEqual(job.amount_paid, Decimal('30000.00'))
+        self.assertEqual(job.balance_due, Decimal('0.00'))
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PAID)
+
+        detail = self.staff_client.get(f'/api/jobs/{job.id}/').data
+        self.assertEqual(Decimal(detail['amount_due']), Decimal('30000.00'))
+        self.assertEqual(Decimal(detail['discount_amount']), Decimal('5000.00'))
+
+        audit = AuditLog.objects.get(action='discount', object_id=str(job.id))
+        self.assertEqual(audit.performed_by, self.staff)
+        self.assertEqual(audit.reason, 'Bulk order discount')
+        self.assertEqual(audit.metadata['discount_amount'], '5000.00')
+
+    def test_discount_limits(self):
+        job = Job.objects.create(
+            customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('10000.00'),
+            amount_paid=Decimal('4000.00'),
+        )
+
+        def pay(**extra):
+            return self.staff_client.post(
+                '/api/payments/', {'job': job.id, 'amount': '1000.00', 'source': 'job', **extra}, format='json'
+            )
+
+        self.assertEqual(pay(agreed_total='12000.00').status_code, 400)  # above the job total
+        self.assertEqual(pay(agreed_total='3000.00').status_code, 400)  # below what was already paid
+        self.assertEqual(
+            self.staff_client.post(
+                '/api/payments/', {'amount': '500.00', 'source': 'walk_in', 'agreed_total': '400.00'}, format='json'
+            ).status_code,
+            400,
+        )  # no job to discount
+
+        # Discounts can't be set by editing the job directly.
+        self.owner_client.patch(f'/api/jobs/{job.id}/', {'discount_amount': '9000.00'}, format='json')
+        job.refresh_from_db()
+        self.assertEqual(job.discount_amount, Decimal('0.00'))
+
+        # Partial payment with a discount leaves the right balance.
+        self.assertEqual(pay(agreed_total='8000.00').status_code, 201)
+        job.refresh_from_db()
+        self.assertEqual(job.discount_amount, Decimal('2000.00'))
+        self.assertEqual(job.amount_paid, Decimal('5000.00'))
+        self.assertEqual(job.balance_due, Decimal('3000.00'))
+        self.assertEqual(job.payment_status, Job.PaymentStatus.PARTIAL)
+
+        # A plain payment without agreed_total keeps the existing discount.
+        self.assertEqual(pay().status_code, 201)
+        job.refresh_from_db()
+        self.assertEqual(job.discount_amount, Decimal('2000.00'))
+        self.assertEqual(job.balance_due, Decimal('2000.00'))

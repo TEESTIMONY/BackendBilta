@@ -396,9 +396,27 @@ class PaymentRecordViewSet(viewsets.ModelViewSet):
         job.save()
 
     def perform_create(self, serializer):
+        agreed_total = serializer.validated_data.pop('agreed_total', None)
+        discount_reason = str(serializer.validated_data.pop('discount_reason', '') or '').strip()
+        discount = None
         with transaction.atomic():
+            if agreed_total is not None:
+                job = Job.objects.select_for_update().get(pk=serializer.validated_data['job'].pk)
+                previous_discount = job.discount_amount
+                job.discount_amount = job.total - agreed_total
+                job.discount_reason = discount_reason
+                job.save()
+                discount = {
+                    'job_id': job.id,
+                    'job_total': str(job.total),
+                    'agreed_total': str(agreed_total),
+                    'discount_amount': str(job.discount_amount),
+                    'previous_discount': str(previous_discount),
+                }
             payment = serializer.save(recorded_by=self.request.user if self.request.user.is_authenticated else None)
             self._adjust_job_paid(payment.job_id, payment.amount)
+        if discount:
+            write_audit('discount', 'Job', discount['job_id'], self.request.user, reason=discount_reason, metadata=discount)
         write_audit('create', 'PaymentRecord', payment.id, self.request.user)
 
     def perform_update(self, serializer):

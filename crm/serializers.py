@@ -222,19 +222,48 @@ class JobSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     status_history = JobStatusHistorySerializer(many=True, read_only=True)
     attachments = JobAttachmentSerializer(many=True, read_only=True)
+    amount_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model = Job
         fields = '__all__'
-        read_only_fields = ('total', 'balance_due', 'payment_status')
+        # Discounts are only applied through a payment (see PaymentRecordSerializer.agreed_total)
+        # so each one is logged with who gave it.
+        read_only_fields = ('total', 'balance_due', 'payment_status', 'discount_amount', 'discount_reason')
 
 
 class PaymentRecordSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.CharField(source='recorded_by.username', read_only=True)
+    # Optional: the price agreed with the customer for the linked job. The difference from
+    # the job's total is saved as a discount before this payment is applied.
+    agreed_total = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.00'), required=False, allow_null=True, write_only=True
+    )
+    discount_reason = serializers.CharField(required=False, allow_blank=True, write_only=True)
 
     class Meta:
         model = PaymentRecord
         fields = '__all__'
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        agreed_total = attrs.get('agreed_total')
+        if agreed_total is None:
+            return attrs
+        if self.instance is not None:
+            raise serializers.ValidationError({'agreed_total': 'Discounts can only be given with a new payment.'})
+        job = attrs.get('job')
+        if not job:
+            raise serializers.ValidationError({'agreed_total': 'Choose a job to apply a discount to.'})
+        if agreed_total > job.total:
+            raise serializers.ValidationError(
+                {'agreed_total': f'The agreed price cannot be more than the job total ({job.total}).'}
+            )
+        if agreed_total < job.amount_paid:
+            raise serializers.ValidationError(
+                {'agreed_total': f'The agreed price cannot be less than what was already paid ({job.amount_paid}).'}
+            )
+        return attrs
 
 
 class PhotocopySessionSerializer(serializers.ModelSerializer):
