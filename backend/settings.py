@@ -101,6 +101,11 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 
 DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
 
+if not DEBUG and not DATABASE_URL and not os.getenv('DB_ENGINE'):
+    # Without this, production would silently start on an empty local SQLite file and the
+    # site would look like all data had vanished. Failing the deploy keeps the old one live.
+    raise ImproperlyConfigured('Set DATABASE_URL when DJANGO_DEBUG is false.')
+
 if DATABASE_URL:
     DATABASES = {
         'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600, ssl_require=not DEBUG),
