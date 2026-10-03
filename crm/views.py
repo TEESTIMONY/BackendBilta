@@ -18,6 +18,7 @@ from .models import (
     Announcement,
     AuditLog,
     Customer,
+    DailyCashCount,
     Job,
     JobAttachment,
     JobStatusHistory,
@@ -37,6 +38,7 @@ from .serializers import (
     AuditLogSerializer,
     AuthLoginSerializer,
     CustomerSerializer,
+    DailyCashCountSerializer,
     CurrentUserSerializer,
     JobSerializer,
     MessageTemplateSerializer,
@@ -529,6 +531,51 @@ class PhotocopySessionViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
                 'gap': money(session.revenue_gap),
             },
         )
+
+
+class DailyCashCountViewSet(viewsets.ModelViewSet):
+    """End-of-day counts. Staff submit and see only their own (for today); owners see everyone's."""
+
+    queryset = DailyCashCount.objects.all().select_related('staff')
+    serializer_class = DailyCashCountSerializer
+    permission_classes = [IsStaffWriteOwnerDelete]
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        queryset = only_own(super().get_queryset(), self.request.user, 'staff')
+        date_value = self.request.query_params.get('date')
+        if date_value:
+            queryset = queryset.filter(date=parse_date_param(date_value, 'date'))
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        # One count per person per day: saving again updates today's count.
+        today = timezone.localdate()
+        existing = DailyCashCount.objects.filter(staff=request.user, date=today).first()
+        serializer = self.get_serializer(existing, data=request.data, partial=bool(existing))
+        serializer.is_valid(raise_exception=True)
+        count = serializer.save(staff=request.user, date=today)
+        data = self.get_serializer(count).data
+        write_audit(
+            'update' if existing else 'create',
+            'DailyCashCount',
+            count.id,
+            request.user,
+            reason=count.note,
+            metadata={
+                'date': str(today),
+                'cash': data['cash_amount'],
+                'transfer': data['transfer_amount'],
+                'recorded': data['recorded_total'],
+                'difference': data['difference'],
+            },
+        )
+        return response.Response(data, status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED)
+
+    def perform_update(self, serializer):
+        if serializer.instance.date != timezone.localdate() and not is_owner_user(self.request.user):
+            raise serializers.ValidationError({'detail': "You can only change today's count."})
+        serializer.save()
 
 
 class AuditLogViewSet(OneDayFilterMixin, viewsets.ReadOnlyModelViewSet):

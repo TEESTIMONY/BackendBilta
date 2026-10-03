@@ -1021,3 +1021,52 @@ class ApiSmokeTests(APITestCase):
             self.assertEqual(refused.status_code, 400)
         allowed = self.owner_client.post('/api/payments/', {'job': website.id, 'amount': '500.00', 'source': 'job'}, format='json')
         self.assertEqual(allowed.status_code, 201, allowed.data)
+
+    def test_end_of_day_cash_count_is_compared_with_the_cms(self):
+        other = User.objects.create_user(username='other_counter', password='StrongPass!234', is_staff=True)
+        other_client = APIClient()
+        other_client.force_authenticate(user=other)
+
+        # Staff recorded N2,700 in payments and N1,000 photocopy cash today.
+        job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('5000.00'), created_by=self.staff)
+        self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '2000.00', 'source': 'job'}, format='json')
+        self.staff_client.post('/api/payments/', {'amount': '700.00', 'source': 'walk_in', 'service_label': 'Scan'}, format='json')
+        self.staff_client.post(
+            '/api/photocopy-sessions/',
+            {'opening_reading': 0, 'closing_reading': 20, 'price_per_copy': '50.00', 'actual_cash_collected': '1000.00'},
+            format='json',
+        )
+
+        # Count is N500 short.
+        first = self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json')
+        self.assertEqual(first.status_code, 201, first.data)
+        self.assertEqual(first.data['recorded_total'], '3700.00')
+        self.assertEqual(first.data['counted_total'], '3200.00')
+        self.assertEqual(Decimal(first.data['difference']), Decimal('-500.00'))
+        self.assertEqual(first.data['date'], str(timezone.localdate()))
+
+        # Recounting the same day updates the same record.
+        again = self.staff_client.post(
+            '/api/cash-counts/', {'cash_amount': '2700.00', 'transfer_amount': '1000.00', 'note': 'Found N500'}, format='json'
+        )
+        self.assertEqual(again.status_code, 200, again.data)
+        self.assertEqual(again.data['id'], first.data['id'])
+        self.assertEqual(Decimal(again.data['difference']), Decimal('0.00'))
+
+        # A later payment changes what the CMS expects, so the check follows it.
+        self.staff_client.post('/api/payments/', {'amount': '300.00', 'source': 'walk_in', 'service_label': 'Print'}, format='json')
+        row = self.staff_client.get(f"/api/cash-counts/?date={timezone.localdate()}").data['results'][0]
+        self.assertEqual(Decimal(row['difference']), Decimal('-300.00'))
+
+        # Staff see only their own count; the owner sees everyone's.
+        other_client.post('/api/cash-counts/', {'cash_amount': '0.00', 'transfer_amount': '0.00'}, format='json')
+        self.assertEqual(len(self.staff_client.get('/api/cash-counts/').data['results']), 1)
+        self.assertEqual(len(other_client.get('/api/cash-counts/').data['results']), 1)
+        self.assertEqual(len(self.owner_client.get('/api/cash-counts/').data['results']), 2)
+
+        # Negative amounts are refused, and every count is logged.
+        self.assertEqual(
+            self.staff_client.post('/api/cash-counts/', {'cash_amount': '-1.00', 'transfer_amount': '0.00'}, format='json').status_code,
+            400,
+        )
+        self.assertTrue(AuditLog.objects.filter(model_name='DailyCashCount', performed_by=self.staff).exists())

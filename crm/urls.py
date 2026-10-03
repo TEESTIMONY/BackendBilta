@@ -5,6 +5,7 @@ from .views import (
     AnnouncementViewSet,
     AuditLogViewSet,
     CustomerViewSet,
+    DailyCashCountViewSet,
     JobViewSet,
     MessageTemplateViewSet,
     OrderMessageLogViewSet,
@@ -35,6 +36,7 @@ router.register(r'jobs', JobViewSet, basename='job')
 router.register(r'payments', PaymentRecordViewSet, basename='payment')
 router.register(r'photocopy-sessions', PhotocopySessionViewSet, basename='photocopy-session')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
+router.register(r'cash-counts', DailyCashCountViewSet, basename='cash-count')
 router.register(r'staff-accounts', StaffAccountViewSet, basename='staff-account')
 router.register(r'staff-invitations', StaffInvitationViewSet, basename='staff-invitation')
 router.register(r'settings', SystemSettingViewSet, basename='system-setting')

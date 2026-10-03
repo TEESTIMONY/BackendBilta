@@ -4,6 +4,7 @@ from .models import (
     Announcement,
     AuditLog,
     Customer,
+    DailyCashCount,
     Job,
     JobStatusHistory,
     MessageTemplate,
@@ -111,3 +112,10 @@ class StaffInvitationAdmin(admin.ModelAdmin):
     list_display = ('email', 'first_name', 'last_name', 'role', 'invited_by', 'accepted_user', 'accepted_at', 'expires_at')
     list_filter = ('role', 'accepted_at')
     search_fields = ('email', 'first_name', 'last_name', 'token')
+
+
+@admin.register(DailyCashCount)
+class DailyCashCountAdmin(admin.ModelAdmin):
+    list_display = ('date', 'staff', 'cash_amount', 'transfer_amount', 'updated_at')
+    list_filter = ('date',)
+    search_fields = ('staff__username', 'staff__first_name', 'staff__last_name', 'note')

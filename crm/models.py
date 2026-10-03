@@ -389,6 +389,27 @@ class PhotocopySession(TimeStampedModel):
         super().save(*args, **kwargs)
 
 
+class DailyCashCount(TimeStampedModel):
+    """A staff member's end-of-day count of the money they actually hold, split by cash and transfer."""
+
+    staff = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='daily_cash_counts')
+    date = models.DateField()
+    cash_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    transfer_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-date', 'staff__first_name']
+        constraints = [models.UniqueConstraint(fields=['staff', 'date'], name='one_cash_count_per_staff_per_day')]
+
+    def __str__(self):
+        return f'{self.staff} {self.date}'
+
+    @property
+    def counted_total(self):
+        return self.cash_amount + self.transfer_amount
+
+
 class AuditLog(TimeStampedModel):
     action = models.CharField(max_length=80)
     model_name = models.CharField(max_length=80)

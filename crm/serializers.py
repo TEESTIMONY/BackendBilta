@@ -12,6 +12,7 @@ from .models import (
     Announcement,
     AuditLog,
     Customer,
+    DailyCashCount,
     Job,
     JobAttachment,
     JobItem,
@@ -367,6 +368,52 @@ class PhotocopySessionSerializer(serializers.ModelSerializer):
         model = PhotocopySession
         fields = '__all__'
         read_only_fields = ('total_copies', 'expected_revenue', 'revenue_gap', 'has_discrepancy')
+
+
+def recorded_total_for(user, day):
+    """Money a staff member recorded in the CMS on `day`: payments plus photocopy cash."""
+    from django.db.models import Sum
+
+    payments = PaymentRecord.objects.filter(recorded_by=user, created_at__date=day).aggregate(t=Sum('amount'))['t']
+    copies = PhotocopySession.objects.filter(staff=user, created_at__date=day).aggregate(t=Sum('actual_cash_collected'))['t']
+    return ((payments or Decimal('0.00')) + (copies or Decimal('0.00'))).quantize(Decimal('0.01'))
+
+
+class DailyCashCountSerializer(serializers.ModelSerializer):
+    staff_name = serializers.SerializerMethodField()
+    counted_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    recorded_total = serializers.SerializerMethodField()
+    difference = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DailyCashCount
+        fields = (
+            'id', 'staff', 'staff_name', 'date', 'cash_amount', 'transfer_amount', 'note',
+            'counted_total', 'recorded_total', 'difference', 'created_at', 'updated_at',
+        )
+        read_only_fields = ('staff', 'date')
+        extra_kwargs = {
+            'cash_amount': {'min_value': Decimal('0.00')},
+            'transfer_amount': {'min_value': Decimal('0.00')},
+        }
+
+    def get_staff_name(self, obj):
+        return person_name(obj.staff)
+
+    def _recorded(self, obj):
+        # Always compare with the latest CMS figures, so later payments update the check.
+        cache = self.context.setdefault('_recorded_totals', {})
+        key = (obj.staff_id, obj.date)
+        if key not in cache:
+            cache[key] = recorded_total_for(obj.staff, obj.date)
+        return cache[key]
+
+    def get_recorded_total(self, obj):
+        return str(self._recorded(obj))
+
+    def get_difference(self, obj):
+        # Positive: more money counted than recorded (over). Negative: short.
+        return str((obj.counted_total - self._recorded(obj)).quantize(Decimal('0.01')))
 
 
 class AuditLogSerializer(serializers.ModelSerializer):
