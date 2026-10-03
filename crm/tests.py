@@ -278,7 +278,7 @@ class ApiSmokeTests(APITestCase):
         unsigned_response = self.client.get(f'/api/job-attachments/{attachment.id}/download/')
         self.assertEqual(unsigned_response.status_code, 403)
 
-        job_detail = self.staff_client.get(f'/api/jobs/{design_job.id}/')
+        job_detail = self.owner_client.get(f'/api/jobs/{design_job.id}/')
         signed_url = job_detail.data['attachments'][0]['download_url']
         download_response = self.client.get(signed_url)
         self.assertEqual(download_response.status_code, 200)
@@ -523,7 +523,7 @@ class ApiSmokeTests(APITestCase):
 
     def test_payment_edit_and_delete_keep_job_balance_in_sync(self):
         job = Job.objects.create(
-            customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('1000.00')
+            customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('1000.00'), created_by=self.staff
         )
         created = self.staff_client.post(
             '/api/payments/', {'job': job.id, 'amount': '300.00', 'source': 'job'}, format='json'
@@ -567,8 +567,8 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(statuses[10], 429)
 
     def test_queue_only_shows_todays_jobs_and_records_filter_by_day(self):
-        today_job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1)
-        old_job = Job.objects.create(customer=self.customer, job_type='binding', quantity=1)
+        today_job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1, created_by=self.staff)
+        old_job = Job.objects.create(customer=self.customer, job_type='binding', quantity=1, created_by=self.staff)
         yesterday = timezone.localdate() - timedelta(days=1)
         Job.objects.filter(id=old_job.id).update(created_at=timezone.now() - timedelta(days=1))
 
@@ -737,12 +737,14 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(len(job_payments(job_id)), 3)
 
         # Daily revenue now matches what the jobs say was collected.
-        summary = self.staff_client.get('/api/reports/daily-summary/').data
+        summary = self.owner_client.get('/api/reports/daily-summary/').data
         self.assertEqual(Decimal(str(summary['total_revenue'])), job.amount_paid)
+        staff_summary = self.staff_client.get('/api/reports/daily-summary/').data
+        self.assertEqual(Decimal(str(staff_summary['total_revenue'])), Decimal('400.00'))
 
     def test_discounted_payment_closes_the_job(self):
         job = Job.objects.create(
-            customer=self.customer, job_type='printing', quantity=35, unit_price=Decimal('1000.00')
+            customer=self.customer, job_type='printing', quantity=35, unit_price=Decimal('1000.00'), created_by=self.staff
         )
         self.assertEqual(job.total, Decimal('35000.00'))
 
@@ -781,7 +783,7 @@ class ApiSmokeTests(APITestCase):
     def test_discount_limits(self):
         job = Job.objects.create(
             customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('10000.00'),
-            amount_paid=Decimal('4000.00'),
+            amount_paid=Decimal('4000.00'), created_by=self.staff,
         )
 
         def pay(**extra):
@@ -956,3 +958,66 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(self.owner_client.get('/api/audit-logs/?date=nope').status_code, 400)
         self.assertEqual(len(self.staff_client.get(f'/api/payments/?date={today}').data['results']), 1)
         self.assertEqual(self.staff_client.get(f'/api/payments/?date={yesterday}').data['results'], [])
+
+    def test_staff_only_see_their_own_jobs_and_money(self):
+        other = User.objects.create_user(
+            username='other_staff', password='StrongPass!234', is_staff=True, first_name='Other', last_name='Staff'
+        )
+        other_client = APIClient()
+        other_client.force_authenticate(user=other)
+
+        def new_job(client, rate):
+            response = client.post(
+                '/api/jobs/',
+                {
+                    'customer': self.customer.id,
+                    'job_type': 'walk_in',
+                    'items': [{'description': 'Copies', 'quantity': 1, 'rate': rate}],
+                    'amount_paid': rate,
+                },
+                format='json',
+            )
+            self.assertEqual(response.status_code, 201, response.data)
+            return response.data['id']
+
+        mine = new_job(self.staff_client, '1000.00')
+        theirs = new_job(other_client, '2500.00')
+        website = Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('500.00'))
+        other_client.post(
+            '/api/photocopy-sessions/',
+            {'opening_reading': 0, 'closing_reading': 10, 'price_per_copy': '50.00', 'actual_cash_collected': '500.00'},
+            format='json',
+        )
+
+        def ids(client, url):
+            data = client.get(url).data
+            rows = data['results'] if isinstance(data, dict) else data
+            return {row['id'] for row in rows}
+
+        # Jobs: list, today's queue, single job and the Records day filter.
+        today = timezone.localdate()
+        self.assertEqual(ids(self.staff_client, '/api/jobs/'), {mine})
+        self.assertEqual(ids(self.staff_client, '/api/jobs/queue/'), {mine})
+        self.assertEqual(ids(self.staff_client, f'/api/jobs/?created_on={today}'), {mine})
+        self.assertEqual(self.staff_client.get(f'/api/jobs/{theirs}/').status_code, 404)
+        self.assertEqual(self.staff_client.get(f'/api/jobs/{website.id}/').status_code, 404)
+        self.assertEqual(ids(self.owner_client, '/api/jobs/'), {mine, theirs, website.id})
+
+        # Money: payments, photocopy sessions and the day's totals.
+        staff_payments = self.staff_client.get('/api/payments/').data['results']
+        self.assertEqual([Decimal(p['amount']) for p in staff_payments], [Decimal('1000.00')])
+        self.assertEqual(self.staff_client.get('/api/photocopy-sessions/').data['results'], [])
+        staff_day = self.staff_client.get('/api/reports/daily-summary/').data
+        self.assertEqual(Decimal(str(staff_day['total_revenue'])), Decimal('1000.00'))
+        self.assertEqual(staff_day['jobs_created'], 1)
+        self.assertEqual(Decimal(str(staff_day['photocopy_revenue'])), Decimal('0'))
+        owner_day = self.owner_client.get('/api/reports/daily-summary/').data
+        self.assertEqual(Decimal(str(owner_day['total_revenue'])), Decimal('3500.00'))
+        self.assertEqual(owner_day['jobs_created'], 3)
+
+        # Staff can't take payment on someone else's job or a website order; the owner can.
+        for job_id in (theirs, website.id):
+            refused = self.staff_client.post('/api/payments/', {'job': job_id, 'amount': '100.00', 'source': 'job'}, format='json')
+            self.assertEqual(refused.status_code, 400)
+        allowed = self.owner_client.post('/api/payments/', {'job': website.id, 'amount': '500.00', 'source': 'job'}, format='json')
+        self.assertEqual(allowed.status_code, 201, allowed.data)

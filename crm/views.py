@@ -124,6 +124,13 @@ def write_audit(action, model_name, object_id='', user=None, reason='', metadata
     )
 
 
+def only_own(queryset, user, field):
+    """Owners see every record; staff see only records where `field` is themselves."""
+    if is_owner_user(user):
+        return queryset
+    return queryset.filter(**{field: user})
+
+
 class OneDayFilterMixin:
     """`?date=YYYY-MM-DD` limits a history list to records created that day (Africa/Lagos)."""
 
@@ -385,7 +392,8 @@ class JobViewSet(viewsets.ModelViewSet):
         write_audit('update', 'Job', job.id, self.request.user, metadata=changes)
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        # Staff work only with jobs they added; website orders (no creator) are owner-only.
+        queryset = only_own(super().get_queryset(), self.request.user, 'created_by')
         created_on = self.request.query_params.get('created_on')
         if created_on:
             queryset = queryset.filter(created_at__date=parse_date_param(created_on, 'created_on'))
@@ -417,6 +425,9 @@ class PaymentRecordViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'amount']
     permission_classes = [IsStaffWriteOwnerDelete]
 
+    def get_queryset(self):
+        return only_own(super().get_queryset(), self.request.user, 'recorded_by')
+
     @staticmethod
     def _adjust_job_paid(job_id, delta):
         if not job_id or not delta:
@@ -426,6 +437,11 @@ class PaymentRecordViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
         job.save()
 
     def perform_create(self, serializer):
+        job = serializer.validated_data.get('job')
+        if job and not is_owner_user(self.request.user) and job.created_by_id != self.request.user.id:
+            raise serializers.ValidationError(
+                {'job': "Only the owner can take payment on another staff member's job or a website order."}
+            )
         agreed_total = serializer.validated_data.pop('agreed_total', None)
         discount_reason = str(serializer.validated_data.pop('discount_reason', '') or '').strip()
         discount = None
@@ -495,6 +511,9 @@ class PhotocopySessionViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
     serializer_class = PhotocopySessionSerializer
     ordering_fields = ['created_at', 'updated_at', 'expected_revenue', 'actual_cash_collected']
     permission_classes = [IsStaffWriteOwnerDelete]
+
+    def get_queryset(self):
+        return only_own(super().get_queryset(), self.request.user, 'staff')
 
     def perform_create(self, serializer):
         session = serializer.save(staff=self.request.user if self.request.user.is_authenticated else None)
@@ -758,14 +777,21 @@ def daily_summary(request):
     start_of_day = timezone.make_aware(datetime.combine(target, datetime.min.time()))
     end_of_day = start_of_day + timedelta(days=1)
 
-    jobs_created = Job.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
-    jobs_completed = Job.objects.filter(
+    # Staff get totals for their own work only; owners get the whole shop.
+    user = request.user
+    jobs = only_own(Job.objects.all(), user, 'created_by')
+    jobs_created = jobs.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+    jobs_completed = jobs.filter(
         status=Job.JobStatus.COMPLETED,
         updated_at__gte=start_of_day,
         updated_at__lt=end_of_day,
     )
-    payments = PaymentRecord.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
-    photocopy = PhotocopySession.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+    payments = only_own(PaymentRecord.objects.all(), user, 'recorded_by').filter(
+        created_at__gte=start_of_day, created_at__lt=end_of_day
+    )
+    photocopy = only_own(PhotocopySession.objects.all(), user, 'staff').filter(
+        created_at__gte=start_of_day, created_at__lt=end_of_day
+    )
 
     outstanding_balances = jobs_created.aggregate(total=Sum('balance_due')).get('total') or Decimal('0.00')
     total_revenue = payments.aggregate(total=Sum('amount')).get('total') or Decimal('0.00')
