@@ -1024,63 +1024,47 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(allowed.status_code, 201, allowed.data)
 
     def test_end_of_day_cash_count_is_compared_with_the_cms(self):
-        other = User.objects.create_user(username='other_counter', password='StrongPass!234', is_staff=True)
-        other_client = APIClient()
-        other_client.force_authenticate(user=other)
-
-        # Staff recorded N2,700 in payments and N1,000 photocopy cash today.
         job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('5000.00'), created_by=self.staff)
-        self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '2000.00', 'source': 'job'}, format='json')
-        self.staff_client.post('/api/payments/', {'amount': '700.00', 'source': 'walk_in', 'service_label': 'Scan'}, format='json')
-        self.staff_client.post(
-            '/api/photocopy-sessions/',
-            {'opening_reading': 0, 'closing_reading': 20, 'price_per_copy': '50.00', 'actual_cash_collected': '1000.00'},
-            format='json',
-        )
-
-        # Count is N500 short.
-        first = self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json')
+        self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '2700.00', 'source': 'job'}, format='json')
+        self.staff_client.post('/api/photocopy-sessions/', {'opening_reading': 0, 'closing_reading': 20, 'price_per_copy': '50.00', 'actual_cash_collected': '1000.00'}, format='json')
+        payload = {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}
+        first = self.owner_client.post('/api/cash-counts/', payload, format='json')
         self.assertEqual(first.status_code, 201, first.data)
-        self.assertEqual(first.data['counted_total'], '3200.00')
+        self.assertNotIn('staff', first.data)
+        self.assertEqual(first.data['recorded_by'], self.owner.id)
+        self.assertEqual(first.data['recorded_total'], '3700.00')
+        self.assertEqual(first.data['difference'], '-500.00')
         self.assertEqual(first.data['date'], str(timezone.localdate()))
-        # Blind count: staff never get the CMS figure or the result...
-        for hidden in ('recorded_total', 'expected_total', 'difference', 'spent_from_takings'):
-            self.assertNotIn(hidden, first.data)
-        staff_row = self.staff_client.get('/api/cash-counts/').data['results'][0]
-        self.assertNotIn('difference', staff_row)
-
-        # ...the owner does.
-        def owner_view():
-            rows = self.owner_client.get(f"/api/cash-counts/?date={timezone.localdate()}").data['results']
-            return next(row for row in rows if row['staff'] == self.staff.id)
-
-        self.assertEqual(owner_view()['recorded_total'], '3700.00')
-        self.assertEqual(Decimal(owner_view()['difference']), Decimal('-500.00'))
-
-        # Recounting the same day updates the same record.
-        again = self.staff_client.post(
-            '/api/cash-counts/', {'cash_amount': '2700.00', 'transfer_amount': '1000.00', 'note': 'Found N500'}, format='json'
-        )
+        url = f"/api/cash-counts/{first.data['id']}/"
+        self.assertEqual(self.staff_client.get('/api/cash-counts/').status_code, 403)
+        self.assertEqual(self.staff_client.get(url).status_code, 403)
+        self.assertEqual(self.staff_client.post('/api/cash-counts/', payload, format='json').status_code, 403)
+        self.assertEqual(self.staff_client.patch(url, {'cash_amount': '1'}, format='json').status_code, 403)
+        self.assertEqual(self.staff_client.delete(url).status_code, 403)
+        payload['cash_amount'] = '2700.00'
+        again = self.owner_client.post('/api/cash-counts/', payload, format='json')
         self.assertEqual(again.status_code, 200, again.data)
         self.assertEqual(again.data['id'], first.data['id'])
-        self.assertEqual(Decimal(owner_view()['difference']), Decimal('0.00'))
-
-        # A later payment changes what the CMS expects, so the check follows it.
+        self.assertEqual(again.data['difference'], '0.00')
         self.staff_client.post('/api/payments/', {'amount': '300.00', 'source': 'walk_in', 'service_label': 'Print'}, format='json')
-        self.assertEqual(Decimal(owner_view()['difference']), Decimal('-300.00'))
+        self.assertEqual(self.owner_client.get(url).data['difference'], '-300.00')
+        self.assertEqual(self.owner_client.post('/api/cash-counts/', payload, format='json').status_code, 200)
+        self.assertEqual(self.owner_client.get('/api/cash-counts/').data['count'], 1)
+        self.assertEqual(self.owner_client.post('/api/cash-counts/', {**payload, 'cash_amount': '-1'}, format='json').status_code, 400)
+        self.assertTrue(AuditLog.objects.filter(model_name='DailyCashCount', performed_by=self.owner).exists())
+        self.assertFalse(AuditLog.objects.filter(model_name='DailyCashCount', performed_by=self.staff).exists())
+        other_owner = User.objects.create_user(username='other_count_admin', is_staff=True, is_superuser=True)
+        other_client = APIClient()
+        other_client.force_authenticate(other_owner)
+        other_client.post('/api/payments/', {'amount': '200.00', 'source': 'walk_in', 'service_label': 'Other till'}, format='json')
+        self.assertEqual(self.owner_client.get(url).data['recorded_total'], '4200.00')
+        updated = other_client.post('/api/cash-counts/', {'cash_amount': '3200.00', 'transfer_amount': '1000.00'}, format='json')
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(updated.data['id'], first.data['id'])
+        self.assertEqual(updated.data['recorded_by'], other_owner.id)
+        self.assertEqual(updated.data['difference'], '0.00')
+        self.assertEqual(self.owner_client.get('/api/cash-counts/').data['count'], 1)
 
-        # Staff see only their own count; the owner sees everyone's.
-        other_client.post('/api/cash-counts/', {'cash_amount': '0.00', 'transfer_amount': '0.00'}, format='json')
-        self.assertEqual(len(self.staff_client.get('/api/cash-counts/').data['results']), 1)
-        self.assertEqual(len(other_client.get('/api/cash-counts/').data['results']), 1)
-        self.assertEqual(len(self.owner_client.get('/api/cash-counts/').data['results']), 2)
-
-        # Negative amounts are refused, and every count is logged.
-        self.assertEqual(
-            self.staff_client.post('/api/cash-counts/', {'cash_amount': '-1.00', 'transfer_amount': '0.00'}, format='json').status_code,
-            400,
-        )
-        self.assertTrue(AuditLog.objects.filter(model_name='DailyCashCount', performed_by=self.staff).exists())
 
     def test_expenses_and_money_statement(self):
         today = timezone.localdate()
@@ -1102,7 +1086,7 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(diesel.status_code, 201, diesel.data)
         self.assertEqual(diesel.data['date'], str(today))
         # Staff count everything they collected, before the diesel was paid out of it.
-        self.staff_client.post('/api/cash-counts/', {'cash_amount': '2700.00', 'transfer_amount': '1000.00'}, format='json')
+        self.owner_client.post('/api/cash-counts/', {'cash_amount': '2700.00', 'transfer_amount': '1000.00'}, format='json')
         count = self.owner_client.get(f'/api/cash-counts/?date={today}').data['results'][0]
         self.assertEqual(count['expected_total'], '3700.00')
         self.assertEqual(Decimal(count['difference']), Decimal('0.00'))
@@ -1124,7 +1108,7 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(self.staff_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').status_code, 403)
         self.assertEqual(self.staff_client.delete(f"/api/expenses/{diesel.data['id']}/").status_code, 403)
 
-        # Statement: received = counted + spent from takings; remaining = received - expenses.
+        # Statement: received = all recorded collections; remaining = received - expenses.
         statement = self.owner_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').data
         days = {row['date']: row for row in statement['days']}
         self.assertEqual(days[str(today)]['received'], '3700.00')
@@ -1211,3 +1195,64 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(first.status_code, 200, first.data)
         self.assertEqual(first.data['id'], second.data['id'])
         self.assertEqual(Customer.objects.filter(customer_type='walk_in').count(), 1)
+
+    def test_owner_job_corrections(self):
+        created = self.staff_client.post('/api/jobs/', {
+            'customer': self.customer.id, 'job_type': 'printing',
+            'items': [{'description': 'Wrong input', 'quantity': 2, 'rate': '100'}],
+            'amount_paid': '50',
+        }, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        url = f"/api/jobs/{created.data['id']}/"
+        changes = {'items': [{'description': 'Correct input', 'quantity': 3, 'rate': '100'}], 'amount_paid': '75'}
+        self.assertEqual(self.staff_client.patch(url, changes, format='json').status_code, 400)
+        corrected = self.owner_client.patch(url, changes, format='json')
+        self.assertEqual(corrected.status_code, 200, corrected.data)
+        self.assertEqual(Decimal(corrected.data['total']), Decimal('300'))
+        self.assertEqual(Decimal(corrected.data['balance_due']), Decimal('225'))
+        job = Job.objects.get(pk=created.data['id'])
+        self.assertEqual(sum(p.amount for p in job.payments.all()), Decimal('75'))
+        history = self.owner_client.get(url).data['edit_history']
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['edited_by'], 'API Owner')
+        self.assertEqual(history[0]['changes']['items']['before'][0]['description'], 'Wrong input')
+        self.assertEqual(history[0]['changes']['items']['after'][0]['quantity'], 3)
+        self.assertEqual(self.staff_client.get(url).data['edit_history'], [])
+        self.owner_client.patch(url, changes, format='json')
+        self.assertEqual(len(self.owner_client.get(url).data['edit_history']), 1)
+        self.owner_client.patch(url, {'status': 'in_progress'}, format='json')
+        self.assertEqual(len(self.owner_client.get(url).data['edit_history']), 1)
+
+    def test_statement_received_includes_all_staff_and_not_the_manual_count(self):
+        today = timezone.localdate()
+        yesterday = today - timedelta(days=1)
+        other = User.objects.create_user(username='second_receipts_staff', is_staff=True)
+        first_payment = None
+        for collector, amount in [(self.staff, '100'), (other, '200'), (self.owner, '300'), (None, '400')]:
+            payment = PaymentRecord.objects.create(recorded_by=collector, source='walk_in', amount=amount)
+            first_payment = first_payment or payment
+        # 00:15 WAT falls on the previous UTC date but belongs to today's collections.
+        midnight_wat = timezone.now().astimezone(timezone.get_current_timezone()).replace(hour=0, minute=15, second=0, microsecond=0)
+        PaymentRecord.objects.filter(pk=first_payment.pk).update(created_at=midnight_wat)
+        for collector, amount in [(self.staff, '150'), (other, '250')]:
+            PhotocopySession.objects.create(staff=collector, opening_reading=0, closing_reading=1, price_per_copy=Decimal(amount), actual_cash_collected=Decimal(amount))
+        old = PaymentRecord.objects.create(recorded_by=other, source='walk_in', amount='75')
+        PaymentRecord.objects.filter(pk=old.pk).update(created_at=midnight_wat - timedelta(days=1))
+        url = f'/api/reports/statement/?start={yesterday}&end={today}'
+        without_count = self.owner_client.get(url).data
+        days = {row['date']: row for row in without_count['days']}
+        self.assertEqual(days[str(today)]['received'], '1400.00')
+        self.assertFalse(days[str(today)]['count_entered'])
+        self.assertEqual(days[str(yesterday)]['received'], '75.00')
+        self.assertEqual(without_count['totals']['received'], '1475.00')
+        self.owner_client.post('/api/cash-counts/', {'cash_amount': '9999', 'transfer_amount': '8888'}, format='json')
+        self.owner_client.post('/api/expenses/', {'amount': '50', 'category': 'materials', 'description': 'Paper'}, format='json')
+        after_count = self.owner_client.get(url).data
+        days = {row['date']: row for row in after_count['days']}
+        self.assertEqual(days[str(today)]['received'], '1400.00')
+        self.assertTrue(days[str(today)]['count_entered'])
+        self.assertEqual(days[str(today)]['remaining'], '1350.00')
+        self.assertEqual(after_count['totals']['received'], '1475.00')
+        self.assertEqual(after_count['totals']['remaining'], '1425.00')
+        self.owner_client.post('/api/cash-counts/', {'cash_amount': '0', 'transfer_amount': '0'}, format='json')
+        self.assertEqual(self.owner_client.get(url).data['totals']['received'], '1475.00')

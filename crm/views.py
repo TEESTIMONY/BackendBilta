@@ -8,7 +8,7 @@ from django.core import signing
 from django.db import transaction
 from django.http import FileResponse
 from django.db.models import Count, Q, Sum
-from django.db.models.functions import TruncMonth
+from django.db.models.functions import TruncDate, TruncMonth
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import decorators, permissions, response, serializers, status, throttling, viewsets
@@ -444,6 +444,16 @@ class JobViewSet(viewsets.ModelViewSet):
                         'detail': 'Only the owner/admin can change job pricing, quantity, or saved payment amounts after creation.'
                     }
                 )
+        correction_fields = {'customer', 'job_type', 'description', 'quantity', 'unit_price', 'amount_paid', 'items', 'deadline', 'fulfilment', 'special_instructions', 'project_scope_note'}
+        def snapshot(job):
+            data = {field: str(getattr(job, field + '_id' if field == 'customer' else field)) for field in correction_fields - {'items'}}
+            for field in ('unit_price', 'amount_paid'):
+                data[field] = money(getattr(job, field))
+            data['items'] = list(job.items.order_by('id').values('description', 'quantity', 'rate'))
+            for item in data['items']:
+                item['rate'] = money(item['rate'])
+            return data
+        before = snapshot(previous)
         old_status = previous.status
         check_staff_status_change(self.request.user, serializer.validated_data.get('status'), old_status)
         old_amount_paid = previous.amount_paid
@@ -454,6 +464,10 @@ class JobViewSet(viewsets.ModelViewSet):
                 job.amount_paid - old_amount_paid,
                 f'Owner adjusted amount paid from {old_amount_paid} to {job.amount_paid}.',
             )
+            after = snapshot(job)
+            corrected = {field: {'before': before[field], 'after': after[field]} for field in correction_fields if before[field] != after[field]}
+            if corrected and is_owner_user(self.request.user):
+                write_audit('correction', 'Job', job.id, self.request.user, metadata={'changes': corrected})
         job.customer.last_job_date = timezone.now()
         job.customer.save(update_fields=['last_job_date', 'updated_at'])
         if old_status != job.status:
@@ -606,49 +620,45 @@ class PhotocopySessionViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
 
 
 class DailyCashCountViewSet(viewsets.ModelViewSet):
-    """End-of-day counts. Staff submit and see only their own (for today); owners see everyone's."""
+    """Only owners view or enter one combined shop count per day."""
 
-    queryset = DailyCashCount.objects.all().select_related('staff')
+    queryset = DailyCashCount.objects.all().select_related('recorded_by')
     serializer_class = DailyCashCountSerializer
-    permission_classes = [IsStaffWriteOwnerDelete]
+    permission_classes = [IsOwnerUser]
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
-        queryset = only_own(super().get_queryset(), self.request.user, 'staff')
+        queryset = super().get_queryset()
         date_value = self.request.query_params.get('date')
         if date_value:
             queryset = queryset.filter(date=parse_date_param(date_value, 'date'))
         return queryset
 
-    def create(self, request, *args, **kwargs):
-        # One count per person per day: saving again updates today's count.
-        today = timezone.localdate()
-        existing = DailyCashCount.objects.filter(staff=request.user, date=today).first()
-        serializer = self.get_serializer(existing, data=request.data, partial=bool(existing))
-        serializer.is_valid(raise_exception=True)
-        count = serializer.save(staff=request.user, date=today)
+    def _audit_count(self, count, action):
         data = self.get_serializer(count).data
-        full = DailyCashCountSerializer(count, context={'show_comparison': True}).data  # for the owner's audit log
-        write_audit(
-            'update' if existing else 'create',
-            'DailyCashCount',
-            count.id,
-            request.user,
-            reason=count.note,
-            metadata={
-                'date': str(today),
-                'cash': full['cash_amount'],
-                'transfer': full['transfer_amount'],
-                'recorded': full['recorded_total'],
-                'difference': full['difference'],
-            },
-        )
-        return response.Response(data, status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED)
+        write_audit(action, 'DailyCashCount', count.id, self.request.user, reason=count.note,
+                    metadata={'date': str(count.date), 'cash': data['cash_amount'], 'transfer': data['transfer_amount'],
+                              'recorded': data['recorded_total'], 'difference': data['difference']})
+
+    def create(self, request, *args, **kwargs):
+        today = timezone.localdate()
+        with transaction.atomic():
+            existing = DailyCashCount.objects.select_for_update().filter(date=today).first()
+            serializer = self.get_serializer(existing, data=request.data, partial=bool(existing))
+            serializer.is_valid(raise_exception=True)
+            count = serializer.save(recorded_by=request.user, date=today)
+            self._audit_count(count, 'update' if existing else 'create')
+        return response.Response(self.get_serializer(count).data,
+                                 status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED)
 
     def perform_update(self, serializer):
-        if serializer.instance.date != timezone.localdate() and not is_owner_user(self.request.user):
-            raise serializers.ValidationError({'detail': "You can only change today's count."})
-        serializer.save()
+        with transaction.atomic():
+            count = serializer.save(recorded_by=self.request.user)
+            self._audit_count(count, 'update')
+
+    def perform_destroy(self, instance):
+        self._audit_count(instance, 'delete')
+        instance.delete()
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
@@ -706,7 +716,7 @@ def expense_details(expense):
 @decorators.api_view(['GET'])
 @decorators.permission_classes([IsOwnerUser])
 def money_statement(request):
-    """Day-by-day money in (staff counts, made before any expenses) and out (expenses), ?start= to ?end=."""
+    """All recorded shop collections and expenses, with manual counts for reconciliation."""
     start = parse_date_param(request.query_params.get('start'), 'start')
     end = parse_date_param(request.query_params.get('end'), 'end')
     if end < start:
@@ -718,11 +728,25 @@ def money_statement(request):
     counts = (
         DailyCashCount.objects.filter(date__range=(start, end))
         .values('date')
-        .annotate(cash=Sum('cash_amount'), transfer=Sum('transfer_amount'), people=Count('id'))
+        .annotate(cash=Sum('cash_amount'), transfer=Sum('transfer_amount'), entries=Count('id'))
     )
     expenses = Expense.objects.filter(date__range=(start, end))
     spent = expenses.values('date').annotate(total=Sum('amount'))
     by_category = expenses.values('category').annotate(total=Sum('amount')).order_by('-total')
+
+    # Received comes from all collectors' records, never from the manual cash count.
+    payments_by_day = {
+        row['day']: row['total'] or zero
+        for row in PaymentRecord.objects.filter(created_at__date__range=(start, end))
+        .annotate(day=TruncDate('created_at', tzinfo=timezone.get_current_timezone()))
+        .values('day').annotate(total=Sum('amount'))
+    }
+    copies_by_day = {
+        row['day']: row['total'] or zero
+        for row in PhotocopySession.objects.filter(created_at__date__range=(start, end))
+        .annotate(day=TruncDate('created_at', tzinfo=timezone.get_current_timezone()))
+        .values('day').annotate(total=Sum('actual_cash_collected'))
+    }
 
     counts_by_day = {row['date']: row for row in counts}
     spent_by_day = {row['date']: row['total'] for row in spent}
@@ -734,13 +758,13 @@ def money_statement(request):
         count = counts_by_day.get(day, {})
         cash = count.get('cash') or zero
         transfer = count.get('transfer') or zero
-        received = cash + transfer
+        received = payments_by_day.get(day, zero) + copies_by_day.get(day, zero)
         spent_today = spent_by_day.get(day) or zero
         days.append({
             'date': str(day),
             'cash': money(cash),
             'transfer': money(transfer),
-            'people_counted': count.get('people') or 0,
+            'count_entered': bool(count),
             'received': money(received),
             'expenses': money(spent_today),
             'remaining': money(received - spent_today),
