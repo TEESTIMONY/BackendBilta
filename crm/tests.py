@@ -1096,17 +1096,17 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(self.staff_client.get('/api/expenses/').status_code, 403)
         diesel = self.owner_client.post(
             '/api/expenses/',
-            {'category': 'fuel', 'description': 'Diesel for generator', 'amount': '500.00', 'paid_by': self.staff.id},
+            {'category': 'fuel', 'description': 'Diesel for generator', 'amount': '500.00'},
             format='json',
         )
         self.assertEqual(diesel.status_code, 201, diesel.data)
         self.assertEqual(diesel.data['date'], str(today))
-        self.assertTrue(diesel.data['paid_from_takings'])
-        self.assertEqual(diesel.data['paid_by_name'], 'API Staff')
-        self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json')
+        # Staff count everything they collected, before the diesel was paid out of it.
+        self.staff_client.post('/api/cash-counts/', {'cash_amount': '2700.00', 'transfer_amount': '1000.00'}, format='json')
         count = self.owner_client.get(f'/api/cash-counts/?date={today}').data['results'][0]
-        self.assertEqual(count['expected_total'], '3200.00')
-        self.assertEqual(Decimal(count['difference']), Decimal('0.00'))  # not flagged short because of the diesel
+        self.assertEqual(count['expected_total'], '3700.00')
+        self.assertEqual(Decimal(count['difference']), Decimal('0.00'))
+        self.assertNotIn('spent_from_takings', count)
 
         # The owner paid rent by transfer from the bank (not from takings), recorded for yesterday too.
         self.owner_client.post(

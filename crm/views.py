@@ -652,7 +652,7 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
-    """Expenses are owner-only. When paid from takings, `paid_by` says whose takings it came from."""
+    """Expenses are owner-only. They are taken off the day's takings in the money statement."""
 
     queryset = Expense.objects.all().select_related('recorded_by', 'paid_by')
     serializer_class = ExpenseSerializer
@@ -706,7 +706,7 @@ def expense_details(expense):
 @decorators.api_view(['GET'])
 @decorators.permission_classes([IsOwnerUser])
 def money_statement(request):
-    """Day-by-day money in (staff counts) and out (expenses) between ?start= and ?end= (inclusive)."""
+    """Day-by-day money in (staff counts, made before any expenses) and out (expenses), ?start= to ?end=."""
     start = parse_date_param(request.query_params.get('start'), 'start')
     end = parse_date_param(request.query_params.get('end'), 'end')
     if end < start:
@@ -722,35 +722,30 @@ def money_statement(request):
     )
     expenses = Expense.objects.filter(date__range=(start, end))
     spent = expenses.values('date').annotate(total=Sum('amount'))
-    from_takings = expenses.filter(paid_from_takings=True).values('date').annotate(total=Sum('amount'))
     by_category = expenses.values('category').annotate(total=Sum('amount')).order_by('-total')
 
     counts_by_day = {row['date']: row for row in counts}
     spent_by_day = {row['date']: row['total'] for row in spent}
-    takings_by_day = {row['date']: row['total'] for row in from_takings}
 
     days = []
-    totals = {'cash': zero, 'transfer': zero, 'spent_from_takings': zero, 'received': zero, 'expenses': zero}
+    totals = {'cash': zero, 'transfer': zero, 'received': zero, 'expenses': zero}
     day = start
     while day <= end:
         count = counts_by_day.get(day, {})
         cash = count.get('cash') or zero
         transfer = count.get('transfer') or zero
-        takings = takings_by_day.get(day) or zero
-        received = cash + transfer + takings
+        received = cash + transfer
         spent_today = spent_by_day.get(day) or zero
         days.append({
             'date': str(day),
             'cash': money(cash),
             'transfer': money(transfer),
             'people_counted': count.get('people') or 0,
-            'spent_from_takings': money(takings),
             'received': money(received),
             'expenses': money(spent_today),
             'remaining': money(received - spent_today),
         })
-        for key, value in (('cash', cash), ('transfer', transfer), ('spent_from_takings', takings),
-                           ('received', received), ('expenses', spent_today)):
+        for key, value in (('cash', cash), ('transfer', transfer), ('received', received), ('expenses', spent_today)):
             totals[key] += value
         day += timedelta(days=1)
 
