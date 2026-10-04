@@ -647,7 +647,8 @@ class ApiSmokeTests(APITestCase):
         # Completing, or moving through any status, does not mark a job paid.
         job = create()
         for status in ('in_progress', 'ready_for_pickup', 'completed'):
-            response = self.staff_client.patch(f'/api/jobs/{job.id}/', {'status': status}, format='json')
+            client = self.owner_client if status == 'completed' else self.staff_client
+            response = client.patch(f'/api/jobs/{job.id}/', {'status': status}, format='json')
             self.assertEqual(response.status_code, 200, response.data)
             job.refresh_from_db()
             self.assertEqual(job.payment_status, Job.PaymentStatus.UNPAID, status)
@@ -733,7 +734,7 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(job.payment_status, Job.PaymentStatus.PARTIAL)
 
         # A status-only update adds nothing.
-        self.staff_client.patch(f'/api/jobs/{job_id}/', {'status': 'completed'}, format='json')
+        self.owner_client.patch(f'/api/jobs/{job_id}/', {'status': 'completed'}, format='json')
         self.assertEqual(len(job_payments(job_id)), 3)
 
         # Daily revenue now matches what the jobs say was collected.
@@ -930,7 +931,7 @@ class ApiSmokeTests(APITestCase):
             },
             format='json',
         ).data
-        self.staff_client.patch(f"/api/jobs/{job['id']}/", {'status': 'completed'}, format='json')
+        self.owner_client.patch(f"/api/jobs/{job['id']}/", {'status': 'completed'}, format='json')
         payment = self.staff_client.post(
             '/api/payments/', {'job': job['id'], 'amount': '600.00', 'source': 'job'}, format='json'
         ).data
@@ -1137,3 +1138,40 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(job['created_by_name'], 'API Staff')
         website = Job.objects.create(customer=self.customer, job_type='printing', quantity=1)
         self.assertEqual(self.owner_client.get(f'/api/jobs/{website.id}/').data['created_by_name'], '')
+
+    def test_only_the_owner_can_close_or_reopen_a_job(self):
+        job = self.staff_client.post(
+            '/api/jobs/',
+            {'customer': self.customer.id, 'job_type': 'walk_in', 'items': [{'description': 'Cards', 'quantity': 1, 'rate': '100.00'}]},
+            format='json',
+        ).data
+        url = f"/api/jobs/{job['id']}/"
+
+        # Staff can move a job through the working steps.
+        for status in ('in_progress', 'ready_for_pickup', 'awaiting_delivery', 'pending'):
+            self.assertEqual(self.staff_client.patch(url, {'status': status}, format='json').status_code, 200, status)
+
+        # ...but not complete or cancel it.
+        for status in ('completed', 'cancelled'):
+            refused = self.staff_client.patch(url, {'status': status}, format='json')
+            self.assertEqual(refused.status_code, 400, status)
+            self.assertIn('Only the owner', str(refused.data))
+        self.assertEqual(Job.objects.get(id=job['id']).status, 'pending')
+
+        # Nor create a job that's already completed.
+        created_done = self.staff_client.post(
+            '/api/jobs/',
+            {'customer': self.customer.id, 'job_type': 'walk_in', 'status': 'completed',
+             'items': [{'description': 'Cards', 'quantity': 1, 'rate': '100.00'}]},
+            format='json',
+        )
+        self.assertEqual(created_done.status_code, 400)
+
+        # The owner completes it; staff can't reopen it, the owner can.
+        self.assertEqual(self.owner_client.patch(url, {'status': 'completed'}, format='json').status_code, 200)
+        reopen = self.staff_client.patch(url, {'status': 'in_progress'}, format='json')
+        self.assertEqual(reopen.status_code, 400)
+        self.assertIn('Only the owner can reopen', str(reopen.data))
+        # Other edits by staff (e.g. deadline) still work on a completed job.
+        self.assertEqual(self.staff_client.patch(url, {'deadline': None}, format='json').status_code, 200)
+        self.assertEqual(self.owner_client.patch(url, {'status': 'in_progress'}, format='json').status_code, 200)

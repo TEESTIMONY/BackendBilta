@@ -326,6 +326,23 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
         return response.Response(self.get_serializer(current).data)
 
 
+# Only the owner can close a job (Completed / Cancelled) or reopen a closed one.
+OWNER_ONLY_JOB_STATUSES = {Job.JobStatus.COMPLETED, Job.JobStatus.CANCELLED}
+
+
+def check_staff_status_change(user, new_status, old_status=None):
+    if is_owner_user(user) or new_status is None or new_status == old_status:
+        return
+    if new_status in OWNER_ONLY_JOB_STATUSES:
+        raise serializers.ValidationError(
+            {'status': f'Only the owner can mark a job as {Job.JobStatus(new_status).label}.'}
+        )
+    if old_status in OWNER_ONLY_JOB_STATUSES:
+        raise serializers.ValidationError(
+            {'status': f'This job is {Job.JobStatus(old_status).label}. Only the owner can reopen it.'}
+        )
+
+
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.all().select_related('customer', 'created_by', 'updated_by').prefetch_related('status_history', 'attachments', 'items')
     serializer_class = JobSerializer
@@ -347,6 +364,7 @@ class JobViewSet(viewsets.ModelViewSet):
         )
 
     def perform_create(self, serializer):
+        check_staff_status_change(self.request.user, serializer.validated_data.get('status'))
         with transaction.atomic():
             job = serializer.save(created_by=self.request.user if self.request.user.is_authenticated else None)
             self._log_amount_paid_change(job, job.amount_paid, 'Paid when the job was created.')
@@ -376,6 +394,7 @@ class JobViewSet(viewsets.ModelViewSet):
                     }
                 )
         old_status = previous.status
+        check_staff_status_change(self.request.user, serializer.validated_data.get('status'), old_status)
         old_amount_paid = previous.amount_paid
         with transaction.atomic():
             job = serializer.save(updated_by=self.request.user if self.request.user.is_authenticated else None)
