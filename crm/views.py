@@ -423,7 +423,7 @@ class JobViewSet(viewsets.ModelViewSet):
 
 
 class PaymentRecordViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
-    queryset = PaymentRecord.objects.all().select_related('job', 'recorded_by')
+    queryset = PaymentRecord.objects.all().select_related('job', 'job__customer', 'recorded_by')
     serializer_class = PaymentRecordSerializer
     search_fields = ['service_label', 'job__job_type', 'job__customer__full_name']
     ordering_fields = ['created_at', 'amount']

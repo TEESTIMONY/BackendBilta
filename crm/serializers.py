@@ -327,9 +327,13 @@ class JobSerializer(serializers.ModelSerializer):
 
 class PaymentRecordSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.SerializerMethodField()
+    customer_name = serializers.SerializerMethodField()
 
     def get_recorded_by_name(self, obj):
         return person_name(obj.recorded_by)
+
+    def get_customer_name(self, obj):
+        return obj.job.customer.full_name if obj.job_id else ''
 
     # Optional: the price agreed with the customer for the linked job. The difference from
     # the job's total is saved as a discount before this payment is applied.
