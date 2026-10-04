@@ -1127,3 +1127,13 @@ class ApiSmokeTests(APITestCase):
             [('Rent & bills', '20000.00'), ('Materials', '3000.00'), ('Fuel / diesel', '500.00')],
         )
         self.assertEqual(self.owner_client.get(f'/api/reports/statement/?start={today}&end={yesterday}').status_code, 400)
+
+    def test_jobs_show_who_added_them(self):
+        job = self.staff_client.post(
+            '/api/jobs/',
+            {'customer': self.customer.id, 'job_type': 'walk_in', 'items': [{'description': 'Cards', 'quantity': 1, 'rate': '100.00'}]},
+            format='json',
+        ).data
+        self.assertEqual(job['created_by_name'], 'API Staff')
+        website = Job.objects.create(customer=self.customer, job_type='printing', quantity=1)
+        self.assertEqual(self.owner_client.get(f'/api/jobs/{website.id}/').data['created_by_name'], '')

@@ -242,7 +242,12 @@ class JobSerializer(serializers.ModelSerializer):
     customer_phone = serializers.CharField(source='customer.phone', read_only=True)
     customer_email = serializers.CharField(source='customer.email', read_only=True)
     customer_business_name = serializers.CharField(source='customer.business_name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+
+    def get_created_by_name(self, obj):
+        # The person who added the job; blank for website orders.
+        return person_name(obj.created_by)
+
     status_history = JobStatusHistorySerializer(many=True, read_only=True)
     attachments = JobAttachmentSerializer(many=True, read_only=True)
     amount_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
