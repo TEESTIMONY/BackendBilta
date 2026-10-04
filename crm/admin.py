@@ -5,6 +5,7 @@ from .models import (
     AuditLog,
     Customer,
     DailyCashCount,
+    Expense,
     Job,
     JobStatusHistory,
     MessageTemplate,
@@ -119,3 +120,10 @@ class DailyCashCountAdmin(admin.ModelAdmin):
     list_display = ('date', 'staff', 'cash_amount', 'transfer_amount', 'updated_at')
     list_filter = ('date',)
     search_fields = ('staff__username', 'staff__first_name', 'staff__last_name', 'note')
+
+
+@admin.register(Expense)
+class ExpenseAdmin(admin.ModelAdmin):
+    list_display = ('date', 'category', 'description', 'amount', 'paid_from_takings', 'recorded_by')
+    list_filter = ('date', 'category', 'paid_from_takings')
+    search_fields = ('description', 'recorded_by__username', 'recorded_by__first_name')

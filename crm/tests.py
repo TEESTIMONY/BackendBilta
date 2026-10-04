@@ -1070,3 +1070,60 @@ class ApiSmokeTests(APITestCase):
             400,
         )
         self.assertTrue(AuditLog.objects.filter(model_name='DailyCashCount', performed_by=self.staff).exists())
+
+    def test_expenses_and_money_statement(self):
+        today = timezone.localdate()
+        yesterday = today - timedelta(days=1)
+
+        # Staff took N3,700 today, spent N500 on diesel from it, and counted what was left.
+        job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('5000.00'), created_by=self.staff)
+        self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '3700.00', 'source': 'job'}, format='json')
+        diesel = self.staff_client.post(
+            '/api/expenses/', {'category': 'fuel', 'description': 'Diesel for generator', 'amount': '500.00'}, format='json'
+        )
+        self.assertEqual(diesel.status_code, 201, diesel.data)
+        self.assertEqual(diesel.data['date'], str(today))
+        self.assertTrue(diesel.data['paid_from_takings'])
+        count = self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json').data
+        self.assertEqual(count['expected_total'], '3200.00')
+        self.assertEqual(Decimal(count['difference']), Decimal('0.00'))  # not flagged short because of the diesel
+
+        # The owner paid rent by transfer from the bank (not from takings), recorded for yesterday too.
+        self.owner_client.post(
+            '/api/expenses/',
+            {'category': 'rent_bills', 'description': 'Shop rent', 'amount': '20000.00', 'paid_from_takings': False},
+            format='json',
+        )
+        self.owner_client.post(
+            '/api/expenses/',
+            {'category': 'materials', 'description': 'A4 paper', 'amount': '3000.00', 'date': str(yesterday), 'paid_from_takings': False},
+            format='json',
+        )
+
+        # Staff rules: own list only, today only, can't see the statement.
+        self.assertEqual(len(self.staff_client.get('/api/expenses/').data['results']), 1)
+        self.assertEqual(
+            self.staff_client.post(
+                '/api/expenses/', {'description': 'Late entry', 'amount': '100.00', 'date': str(yesterday)}, format='json'
+            ).status_code,
+            400,
+        )
+        self.assertEqual(self.staff_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').status_code, 403)
+        self.assertEqual(self.staff_client.delete(f"/api/expenses/{diesel.data['id']}/").status_code, 403)
+
+        # Statement: received = counted + spent from takings; remaining = received - expenses.
+        statement = self.owner_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').data
+        days = {row['date']: row for row in statement['days']}
+        self.assertEqual(days[str(today)]['received'], '3700.00')
+        self.assertEqual(days[str(today)]['expenses'], '20500.00')
+        self.assertEqual(days[str(today)]['remaining'], '-16800.00')
+        self.assertEqual(days[str(yesterday)]['received'], '0.00')
+        self.assertEqual(days[str(yesterday)]['expenses'], '3000.00')
+        self.assertEqual(statement['totals']['received'], '3700.00')
+        self.assertEqual(statement['totals']['expenses'], '23500.00')
+        self.assertEqual(statement['totals']['remaining'], '-19800.00')
+        self.assertEqual(
+            [(row['label'], row['total']) for row in statement['expenses_by_category']],
+            [('Rent & bills', '20000.00'), ('Materials', '3000.00'), ('Fuel / diesel', '500.00')],
+        )
+        self.assertEqual(self.owner_client.get(f'/api/reports/statement/?start={today}&end={yesterday}').status_code, 400)

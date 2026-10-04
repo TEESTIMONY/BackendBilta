@@ -19,6 +19,7 @@ from .models import (
     AuditLog,
     Customer,
     DailyCashCount,
+    Expense,
     Job,
     JobAttachment,
     JobStatusHistory,
@@ -39,6 +40,7 @@ from .serializers import (
     AuthLoginSerializer,
     CustomerSerializer,
     DailyCashCountSerializer,
+    ExpenseSerializer,
     CurrentUserSerializer,
     JobSerializer,
     MessageTemplateSerializer,
@@ -145,7 +147,7 @@ class OneDayFilterMixin:
 
 
 def money(value):
-    return str(value if value is not None else '0.00')
+    return str(Decimal(str(value if value is not None else '0')).quantize(Decimal('0.01')))
 
 
 def parse_date_param(value, name):
@@ -576,6 +578,122 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
         if serializer.instance.date != timezone.localdate() and not is_owner_user(self.request.user):
             raise serializers.ValidationError({'detail': "You can only change today's count."})
         serializer.save()
+
+
+class ExpenseViewSet(viewsets.ModelViewSet):
+    """Expenses. Staff record and see their own (today only); owners see and manage everyone's."""
+
+    queryset = Expense.objects.all().select_related('recorded_by')
+    serializer_class = ExpenseSerializer
+    permission_classes = [IsStaffWriteOwnerDelete]
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        queryset = only_own(super().get_queryset(), self.request.user, 'recorded_by')
+        date_value = self.request.query_params.get('date')
+        if date_value:
+            queryset = queryset.filter(date=parse_date_param(date_value, 'date'))
+        return queryset
+
+    def _checked_date(self, serializer, instance=None):
+        today = timezone.localdate()
+        day = serializer.validated_data.get('date') or (instance.date if instance else today)
+        if not is_owner_user(self.request.user) and day != today:
+            raise serializers.ValidationError({'date': 'Staff can only record expenses for today.'})
+        if day > today:
+            raise serializers.ValidationError({'date': "Expenses can't be recorded for a future day."})
+        return day
+
+    def perform_create(self, serializer):
+        expense = serializer.save(recorded_by=self.request.user, date=self._checked_date(serializer))
+        write_audit('create', 'Expense', expense.id, self.request.user, metadata=expense_details(expense))
+
+    def perform_update(self, serializer):
+        if not is_owner_user(self.request.user) and serializer.instance.date != timezone.localdate():
+            raise serializers.ValidationError({'detail': "You can only change today's expenses."})
+        expense = serializer.save(date=self._checked_date(serializer, serializer.instance))
+        write_audit('update', 'Expense', expense.id, self.request.user, metadata=expense_details(expense))
+
+    def perform_destroy(self, instance):
+        details = expense_details(instance)
+        expense_id = instance.id
+        instance.delete()
+        write_audit('delete', 'Expense', expense_id, self.request.user, metadata=details)
+
+
+def expense_details(expense):
+    return {
+        'date': str(expense.date),
+        'category': expense.category,
+        'description': expense.description,
+        'amount': money(expense.amount),
+        'paid_from_takings': expense.paid_from_takings,
+    }
+
+
+@decorators.api_view(['GET'])
+@decorators.permission_classes([IsOwnerUser])
+def money_statement(request):
+    """Day-by-day money in (staff counts) and out (expenses) between ?start= and ?end= (inclusive)."""
+    start = parse_date_param(request.query_params.get('start'), 'start')
+    end = parse_date_param(request.query_params.get('end'), 'end')
+    if end < start:
+        raise serializers.ValidationError({'end': 'end must be on or after start.'})
+    if (end - start).days > 92:
+        raise serializers.ValidationError({'end': 'Choose a period of at most 3 months.'})
+
+    zero = Decimal('0.00')
+    counts = (
+        DailyCashCount.objects.filter(date__range=(start, end))
+        .values('date')
+        .annotate(cash=Sum('cash_amount'), transfer=Sum('transfer_amount'), people=Count('id'))
+    )
+    expenses = Expense.objects.filter(date__range=(start, end))
+    spent = expenses.values('date').annotate(total=Sum('amount'))
+    from_takings = expenses.filter(paid_from_takings=True).values('date').annotate(total=Sum('amount'))
+    by_category = expenses.values('category').annotate(total=Sum('amount')).order_by('-total')
+
+    counts_by_day = {row['date']: row for row in counts}
+    spent_by_day = {row['date']: row['total'] for row in spent}
+    takings_by_day = {row['date']: row['total'] for row in from_takings}
+
+    days = []
+    totals = {'cash': zero, 'transfer': zero, 'spent_from_takings': zero, 'received': zero, 'expenses': zero}
+    day = start
+    while day <= end:
+        count = counts_by_day.get(day, {})
+        cash = count.get('cash') or zero
+        transfer = count.get('transfer') or zero
+        takings = takings_by_day.get(day) or zero
+        received = cash + transfer + takings
+        spent_today = spent_by_day.get(day) or zero
+        days.append({
+            'date': str(day),
+            'cash': money(cash),
+            'transfer': money(transfer),
+            'people_counted': count.get('people') or 0,
+            'spent_from_takings': money(takings),
+            'received': money(received),
+            'expenses': money(spent_today),
+            'remaining': money(received - spent_today),
+        })
+        for key, value in (('cash', cash), ('transfer', transfer), ('spent_from_takings', takings),
+                           ('received', received), ('expenses', spent_today)):
+            totals[key] += value
+        day += timedelta(days=1)
+
+    labels = dict(Expense.Category.choices)
+    return response.Response({
+        'start': str(start),
+        'end': str(end),
+        'days': days,
+        'totals': {**{key: money(value) for key, value in totals.items()},
+                   'remaining': money(totals['received'] - totals['expenses'])},
+        'expenses_by_category': [
+            {'category': row['category'], 'label': labels.get(row['category'], row['category']), 'total': money(row['total'])}
+            for row in by_category
+        ],
+    })
 
 
 class AuditLogViewSet(OneDayFilterMixin, viewsets.ReadOnlyModelViewSet):
