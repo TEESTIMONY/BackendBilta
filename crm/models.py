@@ -390,20 +390,20 @@ class PhotocopySession(TimeStampedModel):
 
 
 class DailyCashCount(TimeStampedModel):
-    """A staff member's end-of-day count of the money they actually hold, split by cash and transfer."""
+    """One shop-wide cash and transfer count per day, entered by an owner."""
 
-    staff = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='daily_cash_counts')
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='shop_cash_counts_recorded')
     date = models.DateField()
     cash_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
     transfer_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
     note = models.TextField(blank=True)
 
     class Meta:
-        ordering = ['-date', 'staff__first_name']
-        constraints = [models.UniqueConstraint(fields=['staff', 'date'], name='one_cash_count_per_staff_per_day')]
+        ordering = ['-date']
+        constraints = [models.UniqueConstraint(fields=['date'], name='one_shop_cash_count_per_day')]
 
     def __str__(self):
-        return f'{self.staff} {self.date}'
+        return f'Shop count {self.date}'
 
     @property
     def counted_total(self):
@@ -498,3 +498,41 @@ class StaffInvitation(TimeStampedModel):
     @property
     def is_pending(self):
         return not self.accepted_at and self.expires_at > timezone.now()
+
+
+class StaffProfile(TimeStampedModel):
+    staff = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='staff_profile')
+    job_title = models.CharField(max_length=120, blank=True)
+    monthly_salary = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    expected_start = models.TimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['staff__first_name', 'staff__username']
+        constraints = [models.CheckConstraint(condition=models.Q(monthly_salary__gte=0), name='staff_salary_nonnegative')]
+
+    def __str__(self):
+        return self.staff.get_full_name() or self.staff.username
+
+
+class StaffDailyRecord(TimeStampedModel):
+    staff = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='daily_staff_records')
+    date = models.DateField(default=timezone.localdate)
+    expected_start = models.TimeField(null=True, blank=True)
+    resumed_at = models.DateTimeField(null=True, blank=True)
+    left_at = models.DateTimeField(null=True, blank=True)
+    rating = models.PositiveSmallIntegerField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    bonus_recommended = models.BooleanField(default=False)
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='staff_records_added')
+    updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='staff_records_updated')
+
+    class Meta:
+        ordering = ['-date', 'staff__first_name', 'id']
+        constraints = [
+            models.UniqueConstraint(fields=['staff', 'date'], name='one_staff_record_per_day'),
+            models.CheckConstraint(condition=models.Q(rating__isnull=True) | models.Q(rating__gte=1, rating__lte=10), name='staff_rating_1_to_10'),
+            models.CheckConstraint(condition=models.Q(left_at__isnull=True) | models.Q(resumed_at__isnull=False, left_at__gte=models.F('resumed_at')), name='staff_departure_after_arrival'),
+        ]
+
+    def __str__(self):
+        return f'{self.staff} - {self.date}'

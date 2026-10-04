@@ -115,11 +115,25 @@ class StaffInvitationAdmin(admin.ModelAdmin):
     search_fields = ('email', 'first_name', 'last_name', 'token')
 
 
+class OwnerOnlyStaffAdmin(admin.ModelAdmin):
+    def has_view_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    def has_add_permission(self, request):
+        return request.user.is_superuser
+
+    def has_change_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+
 @admin.register(DailyCashCount)
-class DailyCashCountAdmin(admin.ModelAdmin):
-    list_display = ('date', 'staff', 'cash_amount', 'transfer_amount', 'updated_at')
+class DailyCashCountAdmin(OwnerOnlyStaffAdmin):
+    list_display = ('date', 'recorded_by', 'cash_amount', 'transfer_amount', 'updated_at')
     list_filter = ('date',)
-    search_fields = ('staff__username', 'staff__first_name', 'staff__last_name', 'note')
+    search_fields = ('recorded_by__username', 'note')
 
 
 @admin.register(Expense)
@@ -127,3 +141,21 @@ class ExpenseAdmin(admin.ModelAdmin):
     list_display = ('date', 'category', 'description', 'amount', 'paid_from_takings', 'recorded_by')
     list_filter = ('date', 'category', 'paid_from_takings')
     search_fields = ('description', 'recorded_by__username', 'recorded_by__first_name')
+
+
+from .models import StaffProfile, StaffDailyRecord
+
+
+
+
+@admin.register(StaffProfile)
+class StaffProfileAdmin(OwnerOnlyStaffAdmin):
+    list_display = ('staff', 'job_title', 'monthly_salary', 'expected_start')
+    search_fields = ('staff__username', 'staff__first_name', 'staff__last_name', 'job_title')
+
+
+@admin.register(StaffDailyRecord)
+class StaffDailyRecordAdmin(OwnerOnlyStaffAdmin):
+    list_display = ('staff', 'date', 'resumed_at', 'left_at', 'rating', 'bonus_recommended')
+    list_filter = ('date', 'bonus_recommended', 'rating')
+    search_fields = ('staff__username', 'staff__first_name', 'staff__last_name', 'notes')

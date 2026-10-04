@@ -30,7 +30,11 @@ from .views import (
     staff_invitation_detail,
 )
 
+from .staff_views import StaffProfileViewSet, StaffDailyRecordViewSet
+
 router = DefaultRouter()
+router.register(r'staff-profiles', StaffProfileViewSet, basename='staff-profile')
+router.register(r'staff-daily-records', StaffDailyRecordViewSet, basename='staff-daily-record')
 router.register(r'products', ProductViewSet, basename='product')
 router.register(r'customers', CustomerViewSet, basename='customer')
 router.register(r'orders', OrderViewSet, basename='order')
