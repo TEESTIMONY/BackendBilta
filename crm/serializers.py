@@ -449,6 +449,19 @@ class DailyCashCountSerializer(serializers.ModelSerializer):
     def get_expected_total(self, obj):
         return str(self._expected(obj))
 
+    # The comparison with the CMS is for the owner only: staff do a "blind" count.
+    OWNER_ONLY_FIELDS = ('recorded_total', 'spent_from_takings', 'expected_total', 'difference')
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        show_all = self.context.get('show_comparison') or bool(user and user.is_authenticated and user.is_superuser)
+        if not show_all:
+            for field in self.OWNER_ONLY_FIELDS:
+                data.pop(field, None)
+        return data
+
     def get_difference(self, obj):
         # Positive: more money counted than expected (over). Negative: short.
         return str((obj.counted_total - self._expected(obj)).quantize(Decimal('0.01')))

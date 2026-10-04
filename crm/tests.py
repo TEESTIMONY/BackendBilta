@@ -1041,10 +1041,21 @@ class ApiSmokeTests(APITestCase):
         # Count is N500 short.
         first = self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json')
         self.assertEqual(first.status_code, 201, first.data)
-        self.assertEqual(first.data['recorded_total'], '3700.00')
         self.assertEqual(first.data['counted_total'], '3200.00')
-        self.assertEqual(Decimal(first.data['difference']), Decimal('-500.00'))
         self.assertEqual(first.data['date'], str(timezone.localdate()))
+        # Blind count: staff never get the CMS figure or the result...
+        for hidden in ('recorded_total', 'expected_total', 'difference', 'spent_from_takings'):
+            self.assertNotIn(hidden, first.data)
+        staff_row = self.staff_client.get('/api/cash-counts/').data['results'][0]
+        self.assertNotIn('difference', staff_row)
+
+        # ...the owner does.
+        def owner_view():
+            rows = self.owner_client.get(f"/api/cash-counts/?date={timezone.localdate()}").data['results']
+            return next(row for row in rows if row['staff'] == self.staff.id)
+
+        self.assertEqual(owner_view()['recorded_total'], '3700.00')
+        self.assertEqual(Decimal(owner_view()['difference']), Decimal('-500.00'))
 
         # Recounting the same day updates the same record.
         again = self.staff_client.post(
@@ -1052,12 +1063,11 @@ class ApiSmokeTests(APITestCase):
         )
         self.assertEqual(again.status_code, 200, again.data)
         self.assertEqual(again.data['id'], first.data['id'])
-        self.assertEqual(Decimal(again.data['difference']), Decimal('0.00'))
+        self.assertEqual(Decimal(owner_view()['difference']), Decimal('0.00'))
 
         # A later payment changes what the CMS expects, so the check follows it.
         self.staff_client.post('/api/payments/', {'amount': '300.00', 'source': 'walk_in', 'service_label': 'Print'}, format='json')
-        row = self.staff_client.get(f"/api/cash-counts/?date={timezone.localdate()}").data['results'][0]
-        self.assertEqual(Decimal(row['difference']), Decimal('-300.00'))
+        self.assertEqual(Decimal(owner_view()['difference']), Decimal('-300.00'))
 
         # Staff see only their own count; the owner sees everyone's.
         other_client.post('/api/cash-counts/', {'cash_amount': '0.00', 'transfer_amount': '0.00'}, format='json')
@@ -1085,7 +1095,8 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(diesel.status_code, 201, diesel.data)
         self.assertEqual(diesel.data['date'], str(today))
         self.assertTrue(diesel.data['paid_from_takings'])
-        count = self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json').data
+        self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json')
+        count = self.owner_client.get(f'/api/cash-counts/?date={today}').data['results'][0]
         self.assertEqual(count['expected_total'], '3200.00')
         self.assertEqual(Decimal(count['difference']), Decimal('0.00'))  # not flagged short because of the diesel
 

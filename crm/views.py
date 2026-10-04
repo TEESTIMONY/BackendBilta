@@ -577,6 +577,7 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         count = serializer.save(staff=request.user, date=today)
         data = self.get_serializer(count).data
+        full = DailyCashCountSerializer(count, context={'show_comparison': True}).data  # for the owner's audit log
         write_audit(
             'update' if existing else 'create',
             'DailyCashCount',
@@ -585,10 +586,10 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
             reason=count.note,
             metadata={
                 'date': str(today),
-                'cash': data['cash_amount'],
-                'transfer': data['transfer_amount'],
-                'recorded': data['recorded_total'],
-                'difference': data['difference'],
+                'cash': full['cash_amount'],
+                'transfer': full['transfer_amount'],
+                'recorded': full['recorded_total'],
+                'difference': full['difference'],
             },
         )
         return response.Response(data, status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED)
