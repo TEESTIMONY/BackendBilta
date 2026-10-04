@@ -393,7 +393,13 @@ def takings_expenses_for(user, day):
     """Expenses a person paid out of the money they collected on `day`."""
     from django.db.models import Sum
 
-    total = Expense.objects.filter(recorded_by=user, date=day, paid_from_takings=True).aggregate(t=Sum('amount'))['t']
+    from django.db.models import Q
+
+    total = (
+        Expense.objects.filter(date=day, paid_from_takings=True)
+        .filter(Q(paid_by=user) | Q(paid_by__isnull=True, recorded_by=user))
+        .aggregate(t=Sum('amount'))['t']
+    )
     return (total or Decimal('0.00')).quantize(Decimal('0.01'))
 
 
@@ -469,19 +475,23 @@ class DailyCashCountSerializer(serializers.ModelSerializer):
 
 class ExpenseSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.SerializerMethodField()
+    paid_by_name = serializers.SerializerMethodField()
     category_label = serializers.CharField(source='get_category_display', read_only=True)
 
     class Meta:
         model = Expense
         fields = (
             'id', 'date', 'category', 'category_label', 'description', 'amount', 'paid_from_takings',
-            'recorded_by', 'recorded_by_name', 'created_at', 'updated_at',
+            'paid_by', 'paid_by_name', 'recorded_by', 'recorded_by_name', 'created_at', 'updated_at',
         )
         read_only_fields = ('recorded_by',)
         extra_kwargs = {'amount': {'min_value': Decimal('0.01')}, 'date': {'required': False}}
 
     def get_recorded_by_name(self, obj):
         return person_name(obj.recorded_by)
+
+    def get_paid_by_name(self, obj):
+        return person_name(obj.paid_by or obj.recorded_by)
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

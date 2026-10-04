@@ -332,9 +332,9 @@ class ApiSmokeTests(APITestCase):
         customer_create = self.staff_client.post('/api/customers/', customer_payload, format='json')
         self.assertEqual(customer_create.status_code, 201, customer_create.data)
 
-        customer_list = self.staff_client.get('/api/customers/')
+        customer_list = self.owner_client.get('/api/customers/')
         self.assertEqual(customer_list.status_code, 200)
-        customer_detail = self.staff_client.get(f"/api/customers/{customer_create.data['id']}/")
+        customer_detail = self.owner_client.get(f"/api/customers/{customer_create.data['id']}/")
         self.assertEqual(customer_detail.status_code, 200)
 
     def test_order_job_payment_and_reporting_endpoints(self):
@@ -917,7 +917,7 @@ class ApiSmokeTests(APITestCase):
     def test_customer_job_count(self):
         for _ in range(2):
             Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('100.00'))
-        row = self.staff_client.get(f'/api/customers/{self.customer.id}/').data
+        row = self.owner_client.get(f'/api/customers/{self.customer.id}/').data
         self.assertEqual(row['orders_count'], 2)
         self.assertTrue(row['is_returning_customer'])
 
@@ -1089,12 +1089,20 @@ class ApiSmokeTests(APITestCase):
         # Staff took N3,700 today, spent N500 on diesel from it, and counted what was left.
         job = Job.objects.create(customer=self.customer, job_type='printing', quantity=1, unit_price=Decimal('5000.00'), created_by=self.staff)
         self.staff_client.post('/api/payments/', {'job': job.id, 'amount': '3700.00', 'source': 'job'}, format='json')
-        diesel = self.staff_client.post(
-            '/api/expenses/', {'category': 'fuel', 'description': 'Diesel for generator', 'amount': '500.00'}, format='json'
+        # Staff can't use expenses at all; the owner records the diesel against the staff member's takings.
+        self.assertEqual(
+            self.staff_client.post('/api/expenses/', {'description': 'Diesel', 'amount': '500.00'}, format='json').status_code, 403
+        )
+        self.assertEqual(self.staff_client.get('/api/expenses/').status_code, 403)
+        diesel = self.owner_client.post(
+            '/api/expenses/',
+            {'category': 'fuel', 'description': 'Diesel for generator', 'amount': '500.00', 'paid_by': self.staff.id},
+            format='json',
         )
         self.assertEqual(diesel.status_code, 201, diesel.data)
         self.assertEqual(diesel.data['date'], str(today))
         self.assertTrue(diesel.data['paid_from_takings'])
+        self.assertEqual(diesel.data['paid_by_name'], 'API Staff')
         self.staff_client.post('/api/cash-counts/', {'cash_amount': '2200.00', 'transfer_amount': '1000.00'}, format='json')
         count = self.owner_client.get(f'/api/cash-counts/?date={today}').data['results'][0]
         self.assertEqual(count['expected_total'], '3200.00')
@@ -1112,14 +1120,7 @@ class ApiSmokeTests(APITestCase):
             format='json',
         )
 
-        # Staff rules: own list only, today only, can't see the statement.
-        self.assertEqual(len(self.staff_client.get('/api/expenses/').data['results']), 1)
-        self.assertEqual(
-            self.staff_client.post(
-                '/api/expenses/', {'description': 'Late entry', 'amount': '100.00', 'date': str(yesterday)}, format='json'
-            ).status_code,
-            400,
-        )
+        # Staff can't see the statement either.
         self.assertEqual(self.staff_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').status_code, 403)
         self.assertEqual(self.staff_client.delete(f"/api/expenses/{diesel.data['id']}/").status_code, 403)
 
@@ -1186,3 +1187,27 @@ class ApiSmokeTests(APITestCase):
         # Other edits by staff (e.g. deadline) still work on a completed job.
         self.assertEqual(self.staff_client.patch(url, {'deadline': None}, format='json').status_code, 200)
         self.assertEqual(self.owner_client.patch(url, {'status': 'in_progress'}, format='json').status_code, 200)
+
+    def test_staff_can_add_customers_but_not_browse_them(self):
+        # Staff can add a customer...
+        added = self.staff_client.post('/api/customers/', {'full_name': 'New Person', 'phone': '0809 111 2222'}, format='json')
+        self.assertEqual(added.status_code, 201, added.data)
+
+        # ...but not list, view, edit or delete customers.
+        self.assertEqual(self.staff_client.get('/api/customers/').status_code, 403)
+        self.assertEqual(self.staff_client.get(f'/api/customers/{self.customer.id}/').status_code, 403)
+        self.assertEqual(self.staff_client.patch(f'/api/customers/{self.customer.id}/', {'notes': 'x'}, format='json').status_code, 403)
+        self.assertEqual(self.staff_client.delete(f'/api/customers/{self.customer.id}/').status_code, 403)
+        self.assertEqual(self.owner_client.get('/api/customers/').status_code, 200)
+
+        # Adding someone whose phone is already on file reuses them, telling staff only the name.
+        again = self.staff_client.post('/api/customers/', {'full_name': 'Typo Name', 'phone': '+234 800 123 4567'}, format='json')
+        self.assertEqual(again.status_code, 200, again.data)
+        self.assertEqual(again.data, {'id': self.customer.id, 'full_name': 'API Customer', 'existing': True})
+
+        # The shared walk-in customer is created once and reused.
+        first = self.staff_client.post('/api/customers/walk-in/', {}, format='json')
+        second = self.staff_client.post('/api/customers/walk-in/', {}, format='json')
+        self.assertEqual(first.status_code, 200, first.data)
+        self.assertEqual(first.data['id'], second.data['id'])
+        self.assertEqual(Customer.objects.filter(customer_type='walk_in').count(), 1)

@@ -33,6 +33,7 @@ from .models import (
     SystemSetting,
 )
 from .serializers import (
+    person_name,
     ATTACHMENT_LINK_MAX_AGE_SECONDS,
     ATTACHMENT_LINK_SALT,
     AnnouncementSerializer,
@@ -97,6 +98,25 @@ class IsStaffWriteOwnerDelete(permissions.BasePermission):
         if request.method == 'DELETE':
             return is_owner_user(request.user)
         return is_staff_user(request.user)
+
+
+class IsStaffCreateOwnerManage(permissions.BasePermission):
+    """Staff may only add records (POST); everything else (list, view, edit, delete) is owner-only."""
+
+    def has_permission(self, request, view):
+        if request.method == 'POST':
+            return is_staff_user(request.user)
+        return is_owner_user(request.user)
+
+
+def phone_key(value):
+    """0803 123 4567, +2348031234567 and 2348031234567 all become 8031234567."""
+    digits = ''.join(ch for ch in str(value or '') if ch.isdigit())
+    if digits.startswith('234'):
+        return digits[3:]
+    if digits.startswith('0'):
+        return digits[1:]
+    return digits
 
 
 class IsStaffReadOwnerWrite(permissions.BasePermission):
@@ -210,7 +230,38 @@ class CustomerViewSet(viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
     search_fields = ['full_name', 'phone', 'email', 'city']
     ordering_fields = ['full_name', 'created_at', 'updated_at']
-    permission_classes = [IsStaffWriteOwnerDelete]
+    # Staff can add customers but not browse, view or edit the customer list.
+    permission_classes = [IsStaffCreateOwnerManage]
+
+    def create(self, request, *args, **kwargs):
+        # A phone number already on file means a returning customer: reuse them instead of
+        # adding a duplicate. Staff only learn the id and name, not the rest of the record.
+        key = phone_key(request.data.get('phone'))
+        if len(key) >= 7:
+            for customer in Customer.objects.exclude(phone=''):
+                if phone_key(customer.phone) == key:
+                    return response.Response(
+                        {'id': customer.id, 'full_name': customer.full_name, 'existing': True},
+                        status=status.HTTP_200_OK,
+                    )
+        return super().create(request, *args, **kwargs)
+
+    @decorators.action(detail=False, methods=['post'], url_path='walk-in', permission_classes=[IsStaffUser])
+    def walk_in(self, request):
+        """The one shared customer record for anonymous walk-in jobs."""
+        customer = (
+            Customer.objects.filter(customer_type=Customer.CustomerType.WALK_IN, phone='')
+            .filter(full_name__in=['Walk-in', 'Walk-in Customer'])
+            .order_by('id')
+            .first()
+        )
+        if not customer:
+            customer = Customer.objects.create(
+                full_name='Walk-in Customer',
+                customer_type=Customer.CustomerType.WALK_IN,
+                notes='Shared record for walk-in jobs.',
+            )
+        return response.Response({'id': customer.id, 'full_name': customer.full_name})
 
     def perform_create(self, serializer):
         customer = serializer.save()
@@ -601,11 +652,11 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
-    """Expenses. Staff record and see their own (today only); owners see and manage everyone's."""
+    """Expenses are owner-only. When paid from takings, `paid_by` says whose takings it came from."""
 
-    queryset = Expense.objects.all().select_related('recorded_by')
+    queryset = Expense.objects.all().select_related('recorded_by', 'paid_by')
     serializer_class = ExpenseSerializer
-    permission_classes = [IsStaffWriteOwnerDelete]
+    permission_classes = [IsOwnerUser]
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
@@ -648,6 +699,7 @@ def expense_details(expense):
         'description': expense.description,
         'amount': money(expense.amount),
         'paid_from_takings': expense.paid_from_takings,
+        'paid_by': person_name(expense.paid_by) if expense.paid_by_id else '',
     }
 
 
