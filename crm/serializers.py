@@ -389,19 +389,10 @@ def recorded_total_for(user, day):
     return ((payments or Decimal('0.00')) + (copies or Decimal('0.00'))).quantize(Decimal('0.01'))
 
 
-def takings_expenses_for(user, day):
-    """Expenses a person paid out of the money they collected on `day`."""
-    from django.db.models import Sum
-
-    total = Expense.objects.filter(recorded_by=user, date=day, paid_from_takings=True).aggregate(t=Sum('amount'))['t']
-    return (total or Decimal('0.00')).quantize(Decimal('0.01'))
-
-
 class DailyCashCountSerializer(serializers.ModelSerializer):
     staff_name = serializers.SerializerMethodField()
     counted_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     recorded_total = serializers.SerializerMethodField()
-    spent_from_takings = serializers.SerializerMethodField()
     expected_total = serializers.SerializerMethodField()
     difference = serializers.SerializerMethodField()
 
@@ -409,7 +400,7 @@ class DailyCashCountSerializer(serializers.ModelSerializer):
         model = DailyCashCount
         fields = (
             'id', 'staff', 'staff_name', 'date', 'cash_amount', 'transfer_amount', 'note',
-            'counted_total', 'recorded_total', 'spent_from_takings', 'expected_total', 'difference',
+            'counted_total', 'recorded_total', 'expected_total', 'difference',
             'created_at', 'updated_at',
         )
         read_only_fields = ('staff', 'date')
@@ -429,25 +420,29 @@ class DailyCashCountSerializer(serializers.ModelSerializer):
             cache[key] = recorded_total_for(obj.staff, obj.date)
         return cache[key]
 
-    def _spent(self, obj):
-        cache = self.context.setdefault('_spent_totals', {})
-        key = (obj.staff_id, obj.date)
-        if key not in cache:
-            cache[key] = takings_expenses_for(obj.staff, obj.date)
-        return cache[key]
-
     def _expected(self, obj):
-        # What they should be holding: what they recorded, less what they spent from it.
-        return self._recorded(obj) - self._spent(obj)
+        # Staff count everything they collected, before any expenses were paid out of it,
+        # so the count should equal what they recorded in the CMS.
+        return self._recorded(obj)
 
     def get_recorded_total(self, obj):
         return str(self._recorded(obj))
 
-    def get_spent_from_takings(self, obj):
-        return str(self._spent(obj))
-
     def get_expected_total(self, obj):
         return str(self._expected(obj))
+
+    # The comparison with the CMS is for the owner only: staff do a "blind" count.
+    OWNER_ONLY_FIELDS = ('recorded_total', 'expected_total', 'difference')
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        show_all = self.context.get('show_comparison') or bool(user and user.is_authenticated and user.is_superuser)
+        if not show_all:
+            for field in self.OWNER_ONLY_FIELDS:
+                data.pop(field, None)
+        return data
 
     def get_difference(self, obj):
         # Positive: more money counted than expected (over). Negative: short.
@@ -456,19 +451,23 @@ class DailyCashCountSerializer(serializers.ModelSerializer):
 
 class ExpenseSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.SerializerMethodField()
+    paid_by_name = serializers.SerializerMethodField()
     category_label = serializers.CharField(source='get_category_display', read_only=True)
 
     class Meta:
         model = Expense
         fields = (
             'id', 'date', 'category', 'category_label', 'description', 'amount', 'paid_from_takings',
-            'recorded_by', 'recorded_by_name', 'created_at', 'updated_at',
+            'paid_by', 'paid_by_name', 'recorded_by', 'recorded_by_name', 'created_at', 'updated_at',
         )
         read_only_fields = ('recorded_by',)
         extra_kwargs = {'amount': {'min_value': Decimal('0.01')}, 'date': {'required': False}}
 
     def get_recorded_by_name(self, obj):
         return person_name(obj.recorded_by)
+
+    def get_paid_by_name(self, obj):
+        return person_name(obj.paid_by or obj.recorded_by)
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

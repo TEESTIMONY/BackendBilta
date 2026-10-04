@@ -33,6 +33,7 @@ from .models import (
     SystemSetting,
 )
 from .serializers import (
+    person_name,
     ATTACHMENT_LINK_MAX_AGE_SECONDS,
     ATTACHMENT_LINK_SALT,
     AnnouncementSerializer,
@@ -97,6 +98,25 @@ class IsStaffWriteOwnerDelete(permissions.BasePermission):
         if request.method == 'DELETE':
             return is_owner_user(request.user)
         return is_staff_user(request.user)
+
+
+class IsStaffCreateOwnerManage(permissions.BasePermission):
+    """Staff may only add records (POST); everything else (list, view, edit, delete) is owner-only."""
+
+    def has_permission(self, request, view):
+        if request.method == 'POST':
+            return is_staff_user(request.user)
+        return is_owner_user(request.user)
+
+
+def phone_key(value):
+    """0803 123 4567, +2348031234567 and 2348031234567 all become 8031234567."""
+    digits = ''.join(ch for ch in str(value or '') if ch.isdigit())
+    if digits.startswith('234'):
+        return digits[3:]
+    if digits.startswith('0'):
+        return digits[1:]
+    return digits
 
 
 class IsStaffReadOwnerWrite(permissions.BasePermission):
@@ -210,7 +230,38 @@ class CustomerViewSet(viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
     search_fields = ['full_name', 'phone', 'email', 'city']
     ordering_fields = ['full_name', 'created_at', 'updated_at']
-    permission_classes = [IsStaffWriteOwnerDelete]
+    # Staff can add customers but not browse, view or edit the customer list.
+    permission_classes = [IsStaffCreateOwnerManage]
+
+    def create(self, request, *args, **kwargs):
+        # A phone number already on file means a returning customer: reuse them instead of
+        # adding a duplicate. Staff only learn the id and name, not the rest of the record.
+        key = phone_key(request.data.get('phone'))
+        if len(key) >= 7:
+            for customer in Customer.objects.exclude(phone=''):
+                if phone_key(customer.phone) == key:
+                    return response.Response(
+                        {'id': customer.id, 'full_name': customer.full_name, 'existing': True},
+                        status=status.HTTP_200_OK,
+                    )
+        return super().create(request, *args, **kwargs)
+
+    @decorators.action(detail=False, methods=['post'], url_path='walk-in', permission_classes=[IsStaffUser])
+    def walk_in(self, request):
+        """The one shared customer record for anonymous walk-in jobs."""
+        customer = (
+            Customer.objects.filter(customer_type=Customer.CustomerType.WALK_IN, phone='')
+            .filter(full_name__in=['Walk-in', 'Walk-in Customer'])
+            .order_by('id')
+            .first()
+        )
+        if not customer:
+            customer = Customer.objects.create(
+                full_name='Walk-in Customer',
+                customer_type=Customer.CustomerType.WALK_IN,
+                notes='Shared record for walk-in jobs.',
+            )
+        return response.Response({'id': customer.id, 'full_name': customer.full_name})
 
     def perform_create(self, serializer):
         customer = serializer.save()
@@ -326,6 +377,23 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
         return response.Response(self.get_serializer(current).data)
 
 
+# Only the owner can close a job (Completed / Cancelled) or reopen a closed one.
+OWNER_ONLY_JOB_STATUSES = {Job.JobStatus.COMPLETED, Job.JobStatus.CANCELLED}
+
+
+def check_staff_status_change(user, new_status, old_status=None):
+    if is_owner_user(user) or new_status is None or new_status == old_status:
+        return
+    if new_status in OWNER_ONLY_JOB_STATUSES:
+        raise serializers.ValidationError(
+            {'status': f'Only the owner can mark a job as {Job.JobStatus(new_status).label}.'}
+        )
+    if old_status in OWNER_ONLY_JOB_STATUSES:
+        raise serializers.ValidationError(
+            {'status': f'This job is {Job.JobStatus(old_status).label}. Only the owner can reopen it.'}
+        )
+
+
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.all().select_related('customer', 'created_by', 'updated_by').prefetch_related('status_history', 'attachments', 'items')
     serializer_class = JobSerializer
@@ -347,6 +415,7 @@ class JobViewSet(viewsets.ModelViewSet):
         )
 
     def perform_create(self, serializer):
+        check_staff_status_change(self.request.user, serializer.validated_data.get('status'))
         with transaction.atomic():
             job = serializer.save(created_by=self.request.user if self.request.user.is_authenticated else None)
             self._log_amount_paid_change(job, job.amount_paid, 'Paid when the job was created.')
@@ -376,6 +445,7 @@ class JobViewSet(viewsets.ModelViewSet):
                     }
                 )
         old_status = previous.status
+        check_staff_status_change(self.request.user, serializer.validated_data.get('status'), old_status)
         old_amount_paid = previous.amount_paid
         with transaction.atomic():
             job = serializer.save(updated_by=self.request.user if self.request.user.is_authenticated else None)
@@ -558,6 +628,7 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         count = serializer.save(staff=request.user, date=today)
         data = self.get_serializer(count).data
+        full = DailyCashCountSerializer(count, context={'show_comparison': True}).data  # for the owner's audit log
         write_audit(
             'update' if existing else 'create',
             'DailyCashCount',
@@ -566,10 +637,10 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
             reason=count.note,
             metadata={
                 'date': str(today),
-                'cash': data['cash_amount'],
-                'transfer': data['transfer_amount'],
-                'recorded': data['recorded_total'],
-                'difference': data['difference'],
+                'cash': full['cash_amount'],
+                'transfer': full['transfer_amount'],
+                'recorded': full['recorded_total'],
+                'difference': full['difference'],
             },
         )
         return response.Response(data, status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED)
@@ -581,11 +652,11 @@ class DailyCashCountViewSet(viewsets.ModelViewSet):
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
-    """Expenses. Staff record and see their own (today only); owners see and manage everyone's."""
+    """Expenses are owner-only. They are taken off the day's takings in the money statement."""
 
-    queryset = Expense.objects.all().select_related('recorded_by')
+    queryset = Expense.objects.all().select_related('recorded_by', 'paid_by')
     serializer_class = ExpenseSerializer
-    permission_classes = [IsStaffWriteOwnerDelete]
+    permission_classes = [IsOwnerUser]
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
@@ -628,13 +699,14 @@ def expense_details(expense):
         'description': expense.description,
         'amount': money(expense.amount),
         'paid_from_takings': expense.paid_from_takings,
+        'paid_by': person_name(expense.paid_by) if expense.paid_by_id else '',
     }
 
 
 @decorators.api_view(['GET'])
 @decorators.permission_classes([IsOwnerUser])
 def money_statement(request):
-    """Day-by-day money in (staff counts) and out (expenses) between ?start= and ?end= (inclusive)."""
+    """Day-by-day money in (staff counts, made before any expenses) and out (expenses), ?start= to ?end=."""
     start = parse_date_param(request.query_params.get('start'), 'start')
     end = parse_date_param(request.query_params.get('end'), 'end')
     if end < start:
@@ -650,35 +722,30 @@ def money_statement(request):
     )
     expenses = Expense.objects.filter(date__range=(start, end))
     spent = expenses.values('date').annotate(total=Sum('amount'))
-    from_takings = expenses.filter(paid_from_takings=True).values('date').annotate(total=Sum('amount'))
     by_category = expenses.values('category').annotate(total=Sum('amount')).order_by('-total')
 
     counts_by_day = {row['date']: row for row in counts}
     spent_by_day = {row['date']: row['total'] for row in spent}
-    takings_by_day = {row['date']: row['total'] for row in from_takings}
 
     days = []
-    totals = {'cash': zero, 'transfer': zero, 'spent_from_takings': zero, 'received': zero, 'expenses': zero}
+    totals = {'cash': zero, 'transfer': zero, 'received': zero, 'expenses': zero}
     day = start
     while day <= end:
         count = counts_by_day.get(day, {})
         cash = count.get('cash') or zero
         transfer = count.get('transfer') or zero
-        takings = takings_by_day.get(day) or zero
-        received = cash + transfer + takings
+        received = cash + transfer
         spent_today = spent_by_day.get(day) or zero
         days.append({
             'date': str(day),
             'cash': money(cash),
             'transfer': money(transfer),
             'people_counted': count.get('people') or 0,
-            'spent_from_takings': money(takings),
             'received': money(received),
             'expenses': money(spent_today),
             'remaining': money(received - spent_today),
         })
-        for key, value in (('cash', cash), ('transfer', transfer), ('spent_from_takings', takings),
-                           ('received', received), ('expenses', spent_today)):
+        for key, value in (('cash', cash), ('transfer', transfer), ('received', received), ('expenses', spent_today)):
             totals[key] += value
         day += timedelta(days=1)
 

@@ -430,6 +430,10 @@ class Expense(TimeStampedModel):
     # Paid out of the money collected that day, so the payer's end-of-day count will be lower by this much.
     paid_from_takings = models.BooleanField(default=True)
     recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='expenses')
+    # Whose takings it came out of (defaults to whoever recorded it). Their end-of-day count allows for it.
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='expenses_paid'
+    )
 
     class Meta:
         ordering = ['-date', '-created_at']
