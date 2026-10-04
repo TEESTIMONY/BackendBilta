@@ -5,6 +5,8 @@ from .views import (
     AnnouncementViewSet,
     AuditLogViewSet,
     CustomerViewSet,
+    DailyCashCountViewSet,
+    ExpenseViewSet,
     JobViewSet,
     MessageTemplateViewSet,
     OrderMessageLogViewSet,
@@ -19,6 +21,7 @@ from .views import (
     auth_logout,
     auth_me,
     daily_summary,
+    money_statement,
     health_check,
     job_attachment_download,
     public_checkout_request,
@@ -35,6 +38,8 @@ router.register(r'jobs', JobViewSet, basename='job')
 router.register(r'payments', PaymentRecordViewSet, basename='payment')
 router.register(r'photocopy-sessions', PhotocopySessionViewSet, basename='photocopy-session')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
+router.register(r'cash-counts', DailyCashCountViewSet, basename='cash-count')
+router.register(r'expenses', ExpenseViewSet, basename='expense')
 router.register(r'staff-accounts', StaffAccountViewSet, basename='staff-account')
 router.register(r'staff-invitations', StaffInvitationViewSet, basename='staff-invitation')
 router.register(r'settings', SystemSettingViewSet, basename='system-setting')
@@ -53,5 +58,6 @@ urlpatterns = [
     path('public/order-requests/checkout/', public_checkout_request, name='public-checkout-request'),
     path('public/order-requests/design/', public_design_request, name='public-design-request'),
     path('reports/daily-summary/', daily_summary, name='daily-summary'),
+    path('reports/statement/', money_statement, name='money-statement'),
     path('', include(router.urls)),
 ]

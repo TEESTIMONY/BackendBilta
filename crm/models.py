@@ -389,6 +389,55 @@ class PhotocopySession(TimeStampedModel):
         super().save(*args, **kwargs)
 
 
+class DailyCashCount(TimeStampedModel):
+    """A staff member's end-of-day count of the money they actually hold, split by cash and transfer."""
+
+    staff = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='daily_cash_counts')
+    date = models.DateField()
+    cash_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    transfer_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['-date', 'staff__first_name']
+        constraints = [models.UniqueConstraint(fields=['staff', 'date'], name='one_cash_count_per_staff_per_day')]
+
+    def __str__(self):
+        return f'{self.staff} {self.date}'
+
+    @property
+    def counted_total(self):
+        return self.cash_amount + self.transfer_amount
+
+
+class Expense(TimeStampedModel):
+    """Money spent on a given day (diesel, paper, salaries...)."""
+
+    class Category(models.TextChoices):
+        FUEL = 'fuel', 'Fuel / diesel'
+        MATERIALS = 'materials', 'Materials'
+        SALARIES = 'salaries', 'Salaries'
+        TRANSPORT = 'transport', 'Transport'
+        RENT_BILLS = 'rent_bills', 'Rent & bills'
+        REPAIRS = 'repairs', 'Repairs'
+        FOOD = 'food', 'Food'
+        OTHER = 'other', 'Other'
+
+    date = models.DateField()
+    category = models.CharField(max_length=20, choices=Category.choices, default=Category.OTHER)
+    description = models.CharField(max_length=255)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    # Paid out of the money collected that day, so the payer's end-of-day count will be lower by this much.
+    paid_from_takings = models.BooleanField(default=True)
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='expenses')
+
+    class Meta:
+        ordering = ['-date', '-created_at']
+
+    def __str__(self):
+        return f'{self.date} {self.description} {self.amount}'
+
+
 class AuditLog(TimeStampedModel):
     action = models.CharField(max_length=80)
     model_name = models.CharField(max_length=80)

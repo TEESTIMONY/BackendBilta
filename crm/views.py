@@ -18,6 +18,8 @@ from .models import (
     Announcement,
     AuditLog,
     Customer,
+    DailyCashCount,
+    Expense,
     Job,
     JobAttachment,
     JobStatusHistory,
@@ -37,6 +39,8 @@ from .serializers import (
     AuditLogSerializer,
     AuthLoginSerializer,
     CustomerSerializer,
+    DailyCashCountSerializer,
+    ExpenseSerializer,
     CurrentUserSerializer,
     JobSerializer,
     MessageTemplateSerializer,
@@ -124,6 +128,13 @@ def write_audit(action, model_name, object_id='', user=None, reason='', metadata
     )
 
 
+def only_own(queryset, user, field):
+    """Owners see every record; staff see only records where `field` is themselves."""
+    if is_owner_user(user):
+        return queryset
+    return queryset.filter(**{field: user})
+
+
 class OneDayFilterMixin:
     """`?date=YYYY-MM-DD` limits a history list to records created that day (Africa/Lagos)."""
 
@@ -136,7 +147,7 @@ class OneDayFilterMixin:
 
 
 def money(value):
-    return str(value if value is not None else '0.00')
+    return str(Decimal(str(value if value is not None else '0')).quantize(Decimal('0.01')))
 
 
 def parse_date_param(value, name):
@@ -385,7 +396,8 @@ class JobViewSet(viewsets.ModelViewSet):
         write_audit('update', 'Job', job.id, self.request.user, metadata=changes)
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        # Staff work only with jobs they added; website orders (no creator) are owner-only.
+        queryset = only_own(super().get_queryset(), self.request.user, 'created_by')
         created_on = self.request.query_params.get('created_on')
         if created_on:
             queryset = queryset.filter(created_at__date=parse_date_param(created_on, 'created_on'))
@@ -411,11 +423,14 @@ class JobViewSet(viewsets.ModelViewSet):
 
 
 class PaymentRecordViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
-    queryset = PaymentRecord.objects.all().select_related('job', 'recorded_by')
+    queryset = PaymentRecord.objects.all().select_related('job', 'job__customer', 'recorded_by')
     serializer_class = PaymentRecordSerializer
     search_fields = ['service_label', 'job__job_type', 'job__customer__full_name']
     ordering_fields = ['created_at', 'amount']
     permission_classes = [IsStaffWriteOwnerDelete]
+
+    def get_queryset(self):
+        return only_own(super().get_queryset(), self.request.user, 'recorded_by')
 
     @staticmethod
     def _adjust_job_paid(job_id, delta):
@@ -426,6 +441,11 @@ class PaymentRecordViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
         job.save()
 
     def perform_create(self, serializer):
+        job = serializer.validated_data.get('job')
+        if job and not is_owner_user(self.request.user) and job.created_by_id != self.request.user.id:
+            raise serializers.ValidationError(
+                {'job': "Only the owner can take payment on another staff member's job or a website order."}
+            )
         agreed_total = serializer.validated_data.pop('agreed_total', None)
         discount_reason = str(serializer.validated_data.pop('discount_reason', '') or '').strip()
         discount = None
@@ -496,6 +516,9 @@ class PhotocopySessionViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'updated_at', 'expected_revenue', 'actual_cash_collected']
     permission_classes = [IsStaffWriteOwnerDelete]
 
+    def get_queryset(self):
+        return only_own(super().get_queryset(), self.request.user, 'staff')
+
     def perform_create(self, serializer):
         session = serializer.save(staff=self.request.user if self.request.user.is_authenticated else None)
         write_audit(
@@ -510,6 +533,167 @@ class PhotocopySessionViewSet(OneDayFilterMixin, viewsets.ModelViewSet):
                 'gap': money(session.revenue_gap),
             },
         )
+
+
+class DailyCashCountViewSet(viewsets.ModelViewSet):
+    """End-of-day counts. Staff submit and see only their own (for today); owners see everyone's."""
+
+    queryset = DailyCashCount.objects.all().select_related('staff')
+    serializer_class = DailyCashCountSerializer
+    permission_classes = [IsStaffWriteOwnerDelete]
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        queryset = only_own(super().get_queryset(), self.request.user, 'staff')
+        date_value = self.request.query_params.get('date')
+        if date_value:
+            queryset = queryset.filter(date=parse_date_param(date_value, 'date'))
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        # One count per person per day: saving again updates today's count.
+        today = timezone.localdate()
+        existing = DailyCashCount.objects.filter(staff=request.user, date=today).first()
+        serializer = self.get_serializer(existing, data=request.data, partial=bool(existing))
+        serializer.is_valid(raise_exception=True)
+        count = serializer.save(staff=request.user, date=today)
+        data = self.get_serializer(count).data
+        write_audit(
+            'update' if existing else 'create',
+            'DailyCashCount',
+            count.id,
+            request.user,
+            reason=count.note,
+            metadata={
+                'date': str(today),
+                'cash': data['cash_amount'],
+                'transfer': data['transfer_amount'],
+                'recorded': data['recorded_total'],
+                'difference': data['difference'],
+            },
+        )
+        return response.Response(data, status=status.HTTP_200_OK if existing else status.HTTP_201_CREATED)
+
+    def perform_update(self, serializer):
+        if serializer.instance.date != timezone.localdate() and not is_owner_user(self.request.user):
+            raise serializers.ValidationError({'detail': "You can only change today's count."})
+        serializer.save()
+
+
+class ExpenseViewSet(viewsets.ModelViewSet):
+    """Expenses. Staff record and see their own (today only); owners see and manage everyone's."""
+
+    queryset = Expense.objects.all().select_related('recorded_by')
+    serializer_class = ExpenseSerializer
+    permission_classes = [IsStaffWriteOwnerDelete]
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        queryset = only_own(super().get_queryset(), self.request.user, 'recorded_by')
+        date_value = self.request.query_params.get('date')
+        if date_value:
+            queryset = queryset.filter(date=parse_date_param(date_value, 'date'))
+        return queryset
+
+    def _checked_date(self, serializer, instance=None):
+        today = timezone.localdate()
+        day = serializer.validated_data.get('date') or (instance.date if instance else today)
+        if not is_owner_user(self.request.user) and day != today:
+            raise serializers.ValidationError({'date': 'Staff can only record expenses for today.'})
+        if day > today:
+            raise serializers.ValidationError({'date': "Expenses can't be recorded for a future day."})
+        return day
+
+    def perform_create(self, serializer):
+        expense = serializer.save(recorded_by=self.request.user, date=self._checked_date(serializer))
+        write_audit('create', 'Expense', expense.id, self.request.user, metadata=expense_details(expense))
+
+    def perform_update(self, serializer):
+        if not is_owner_user(self.request.user) and serializer.instance.date != timezone.localdate():
+            raise serializers.ValidationError({'detail': "You can only change today's expenses."})
+        expense = serializer.save(date=self._checked_date(serializer, serializer.instance))
+        write_audit('update', 'Expense', expense.id, self.request.user, metadata=expense_details(expense))
+
+    def perform_destroy(self, instance):
+        details = expense_details(instance)
+        expense_id = instance.id
+        instance.delete()
+        write_audit('delete', 'Expense', expense_id, self.request.user, metadata=details)
+
+
+def expense_details(expense):
+    return {
+        'date': str(expense.date),
+        'category': expense.category,
+        'description': expense.description,
+        'amount': money(expense.amount),
+        'paid_from_takings': expense.paid_from_takings,
+    }
+
+
+@decorators.api_view(['GET'])
+@decorators.permission_classes([IsOwnerUser])
+def money_statement(request):
+    """Day-by-day money in (staff counts) and out (expenses) between ?start= and ?end= (inclusive)."""
+    start = parse_date_param(request.query_params.get('start'), 'start')
+    end = parse_date_param(request.query_params.get('end'), 'end')
+    if end < start:
+        raise serializers.ValidationError({'end': 'end must be on or after start.'})
+    if (end - start).days > 92:
+        raise serializers.ValidationError({'end': 'Choose a period of at most 3 months.'})
+
+    zero = Decimal('0.00')
+    counts = (
+        DailyCashCount.objects.filter(date__range=(start, end))
+        .values('date')
+        .annotate(cash=Sum('cash_amount'), transfer=Sum('transfer_amount'), people=Count('id'))
+    )
+    expenses = Expense.objects.filter(date__range=(start, end))
+    spent = expenses.values('date').annotate(total=Sum('amount'))
+    from_takings = expenses.filter(paid_from_takings=True).values('date').annotate(total=Sum('amount'))
+    by_category = expenses.values('category').annotate(total=Sum('amount')).order_by('-total')
+
+    counts_by_day = {row['date']: row for row in counts}
+    spent_by_day = {row['date']: row['total'] for row in spent}
+    takings_by_day = {row['date']: row['total'] for row in from_takings}
+
+    days = []
+    totals = {'cash': zero, 'transfer': zero, 'spent_from_takings': zero, 'received': zero, 'expenses': zero}
+    day = start
+    while day <= end:
+        count = counts_by_day.get(day, {})
+        cash = count.get('cash') or zero
+        transfer = count.get('transfer') or zero
+        takings = takings_by_day.get(day) or zero
+        received = cash + transfer + takings
+        spent_today = spent_by_day.get(day) or zero
+        days.append({
+            'date': str(day),
+            'cash': money(cash),
+            'transfer': money(transfer),
+            'people_counted': count.get('people') or 0,
+            'spent_from_takings': money(takings),
+            'received': money(received),
+            'expenses': money(spent_today),
+            'remaining': money(received - spent_today),
+        })
+        for key, value in (('cash', cash), ('transfer', transfer), ('spent_from_takings', takings),
+                           ('received', received), ('expenses', spent_today)):
+            totals[key] += value
+        day += timedelta(days=1)
+
+    labels = dict(Expense.Category.choices)
+    return response.Response({
+        'start': str(start),
+        'end': str(end),
+        'days': days,
+        'totals': {**{key: money(value) for key, value in totals.items()},
+                   'remaining': money(totals['received'] - totals['expenses'])},
+        'expenses_by_category': [
+            {'category': row['category'], 'label': labels.get(row['category'], row['category']), 'total': money(row['total'])}
+            for row in by_category
+        ],
+    })
 
 
 class AuditLogViewSet(OneDayFilterMixin, viewsets.ReadOnlyModelViewSet):
@@ -758,14 +942,21 @@ def daily_summary(request):
     start_of_day = timezone.make_aware(datetime.combine(target, datetime.min.time()))
     end_of_day = start_of_day + timedelta(days=1)
 
-    jobs_created = Job.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
-    jobs_completed = Job.objects.filter(
+    # Staff get totals for their own work only; owners get the whole shop.
+    user = request.user
+    jobs = only_own(Job.objects.all(), user, 'created_by')
+    jobs_created = jobs.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+    jobs_completed = jobs.filter(
         status=Job.JobStatus.COMPLETED,
         updated_at__gte=start_of_day,
         updated_at__lt=end_of_day,
     )
-    payments = PaymentRecord.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
-    photocopy = PhotocopySession.objects.filter(created_at__gte=start_of_day, created_at__lt=end_of_day)
+    payments = only_own(PaymentRecord.objects.all(), user, 'recorded_by').filter(
+        created_at__gte=start_of_day, created_at__lt=end_of_day
+    )
+    photocopy = only_own(PhotocopySession.objects.all(), user, 'staff').filter(
+        created_at__gte=start_of_day, created_at__lt=end_of_day
+    )
 
     outstanding_balances = jobs_created.aggregate(total=Sum('balance_due')).get('total') or Decimal('0.00')
     total_revenue = payments.aggregate(total=Sum('amount')).get('total') or Decimal('0.00')

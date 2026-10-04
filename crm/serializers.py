@@ -12,6 +12,8 @@ from .models import (
     Announcement,
     AuditLog,
     Customer,
+    DailyCashCount,
+    Expense,
     Job,
     JobAttachment,
     JobItem,
@@ -240,7 +242,12 @@ class JobSerializer(serializers.ModelSerializer):
     customer_phone = serializers.CharField(source='customer.phone', read_only=True)
     customer_email = serializers.CharField(source='customer.email', read_only=True)
     customer_business_name = serializers.CharField(source='customer.business_name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+
+    def get_created_by_name(self, obj):
+        # The person who added the job; blank for website orders.
+        return person_name(obj.created_by)
+
     status_history = JobStatusHistorySerializer(many=True, read_only=True)
     attachments = JobAttachmentSerializer(many=True, read_only=True)
     amount_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
@@ -320,9 +327,13 @@ class JobSerializer(serializers.ModelSerializer):
 
 class PaymentRecordSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.SerializerMethodField()
+    customer_name = serializers.SerializerMethodField()
 
     def get_recorded_by_name(self, obj):
         return person_name(obj.recorded_by)
+
+    def get_customer_name(self, obj):
+        return obj.job.customer.full_name if obj.job_id else ''
 
     # Optional: the price agreed with the customer for the linked job. The difference from
     # the job's total is saved as a discount before this payment is applied.
@@ -367,6 +378,97 @@ class PhotocopySessionSerializer(serializers.ModelSerializer):
         model = PhotocopySession
         fields = '__all__'
         read_only_fields = ('total_copies', 'expected_revenue', 'revenue_gap', 'has_discrepancy')
+
+
+def recorded_total_for(user, day):
+    """Money a staff member recorded in the CMS on `day`: payments plus photocopy cash."""
+    from django.db.models import Sum
+
+    payments = PaymentRecord.objects.filter(recorded_by=user, created_at__date=day).aggregate(t=Sum('amount'))['t']
+    copies = PhotocopySession.objects.filter(staff=user, created_at__date=day).aggregate(t=Sum('actual_cash_collected'))['t']
+    return ((payments or Decimal('0.00')) + (copies or Decimal('0.00'))).quantize(Decimal('0.01'))
+
+
+def takings_expenses_for(user, day):
+    """Expenses a person paid out of the money they collected on `day`."""
+    from django.db.models import Sum
+
+    total = Expense.objects.filter(recorded_by=user, date=day, paid_from_takings=True).aggregate(t=Sum('amount'))['t']
+    return (total or Decimal('0.00')).quantize(Decimal('0.01'))
+
+
+class DailyCashCountSerializer(serializers.ModelSerializer):
+    staff_name = serializers.SerializerMethodField()
+    counted_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    recorded_total = serializers.SerializerMethodField()
+    spent_from_takings = serializers.SerializerMethodField()
+    expected_total = serializers.SerializerMethodField()
+    difference = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DailyCashCount
+        fields = (
+            'id', 'staff', 'staff_name', 'date', 'cash_amount', 'transfer_amount', 'note',
+            'counted_total', 'recorded_total', 'spent_from_takings', 'expected_total', 'difference',
+            'created_at', 'updated_at',
+        )
+        read_only_fields = ('staff', 'date')
+        extra_kwargs = {
+            'cash_amount': {'min_value': Decimal('0.00')},
+            'transfer_amount': {'min_value': Decimal('0.00')},
+        }
+
+    def get_staff_name(self, obj):
+        return person_name(obj.staff)
+
+    def _recorded(self, obj):
+        # Always compare with the latest CMS figures, so later payments update the check.
+        cache = self.context.setdefault('_recorded_totals', {})
+        key = (obj.staff_id, obj.date)
+        if key not in cache:
+            cache[key] = recorded_total_for(obj.staff, obj.date)
+        return cache[key]
+
+    def _spent(self, obj):
+        cache = self.context.setdefault('_spent_totals', {})
+        key = (obj.staff_id, obj.date)
+        if key not in cache:
+            cache[key] = takings_expenses_for(obj.staff, obj.date)
+        return cache[key]
+
+    def _expected(self, obj):
+        # What they should be holding: what they recorded, less what they spent from it.
+        return self._recorded(obj) - self._spent(obj)
+
+    def get_recorded_total(self, obj):
+        return str(self._recorded(obj))
+
+    def get_spent_from_takings(self, obj):
+        return str(self._spent(obj))
+
+    def get_expected_total(self, obj):
+        return str(self._expected(obj))
+
+    def get_difference(self, obj):
+        # Positive: more money counted than expected (over). Negative: short.
+        return str((obj.counted_total - self._expected(obj)).quantize(Decimal('0.01')))
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    recorded_by_name = serializers.SerializerMethodField()
+    category_label = serializers.CharField(source='get_category_display', read_only=True)
+
+    class Meta:
+        model = Expense
+        fields = (
+            'id', 'date', 'category', 'category_label', 'description', 'amount', 'paid_from_takings',
+            'recorded_by', 'recorded_by_name', 'created_at', 'updated_at',
+        )
+        read_only_fields = ('recorded_by',)
+        extra_kwargs = {'amount': {'min_value': Decimal('0.01')}, 'date': {'required': False}}
+
+    def get_recorded_by_name(self, obj):
+        return person_name(obj.recorded_by)
 
 
 class AuditLogSerializer(serializers.ModelSerializer):
