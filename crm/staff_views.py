@@ -1,8 +1,13 @@
 from django.db import transaction
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
 from rest_framework import viewsets
 from .models import StaffProfile, StaffDailyRecord
 from .staff_serializers import StaffProfileSerializer, StaffDailyRecordSerializer
-from .views import IsStaffReadOwnerWrite, only_own, parse_date_param, write_audit
+from .views import only_own, parse_date_param, write_audit, IsStaffUser, IsOwnerUser
 
 
 def changed_values(before, after):
@@ -14,7 +19,7 @@ def changed_values(before, after):
 class StaffProfileViewSet(viewsets.ModelViewSet):
     queryset = StaffProfile.objects.select_related('staff').all()
     serializer_class = StaffProfileSerializer
-    permission_classes = [IsStaffReadOwnerWrite]
+    permission_classes = [IsOwnerUser]
     http_method_names = ['get', 'patch', 'head', 'options']
 
     def get_queryset(self):
@@ -33,7 +38,7 @@ class StaffProfileViewSet(viewsets.ModelViewSet):
 class StaffDailyRecordViewSet(viewsets.ModelViewSet):
     queryset = StaffDailyRecord.objects.select_related('staff', 'recorded_by', 'updated_by').all()
     serializer_class = StaffDailyRecordSerializer
-    permission_classes = [IsStaffReadOwnerWrite]
+    permission_classes = [IsOwnerUser]
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
@@ -69,3 +74,51 @@ class StaffDailyRecordViewSet(viewsets.ModelViewSet):
                 write_audit('update', 'StaffDailyRecord', record.id, self.request.user,
                             metadata={'staff_name': record.staff.get_full_name() or record.staff.username,
                                       'date': str(record.date), 'changes': changes})
+
+    def attendance_record(self):
+        records = StaffDailyRecord.objects.filter(staff=self.request.user)
+        return (records.filter(resumed_at__isnull=False, left_at__isnull=True).order_by('-date').first()
+                or records.filter(date=timezone.localdate()).first())
+
+    @action(detail=False, methods=['get'], permission_classes=[IsStaffUser])
+    def attendance(self, request):
+        record = self.attendance_record()
+        return Response(self.get_serializer(record).data if record else None)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsStaffUser], url_path='sign-in')
+    def sign_in(self, request):
+        if request.data:
+            raise ValidationError('Attendance times are recorded automatically. Do not supply fields.')
+        with transaction.atomic():
+            get_user_model().objects.select_for_update().get(pk=request.user.pk)
+            existing = self.attendance_record()
+            if existing and existing.resumed_at:
+                raise ValidationError('You have already signed in. Contact admin for corrections.')
+            profile, _ = StaffProfile.objects.get_or_create(staff=request.user)
+            record, _ = StaffDailyRecord.objects.get_or_create(
+                staff=request.user, date=timezone.localdate(),
+                defaults={'expected_start': profile.expected_start, 'recorded_by': request.user})
+            record.resumed_at = timezone.now()
+            record.updated_by = request.user
+            record.save(update_fields=['resumed_at', 'updated_by', 'updated_at'])
+            write_audit('sign_in', 'StaffDailyRecord', record.id, request.user,
+                        metadata={'date': str(record.date), 'resumed_at': record.resumed_at.isoformat()})
+        return Response(self.get_serializer(record).data)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsStaffUser], url_path='sign-out')
+    def sign_out(self, request):
+        if request.data:
+            raise ValidationError('Attendance times are recorded automatically. Do not supply fields.')
+        with transaction.atomic():
+            get_user_model().objects.select_for_update().get(pk=request.user.pk)
+            record = self.attendance_record()
+            if not record or not record.resumed_at or record.left_at:
+                raise ValidationError('Sign in first. You can only sign out once per shift.')
+            record.left_at = timezone.now()
+            if record.left_at < record.resumed_at:
+                raise ValidationError('Leaving time cannot be before arrival.')
+            record.updated_by = request.user
+            record.save(update_fields=['left_at', 'updated_by', 'updated_at'])
+            write_audit('sign_out', 'StaffDailyRecord', record.id, request.user,
+                        metadata={'date': str(record.date), 'left_at': record.left_at.isoformat()})
+        return Response(self.get_serializer(record).data)

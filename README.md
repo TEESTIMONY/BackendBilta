@@ -94,7 +94,7 @@ VITE_USE_DJANGO_API=true
 
 The frontend's `/team/staff` page lets owners set staff names, job roles, fixed monthly salaries (NGN), and expected resumption times (Africa/Lagos).
 
-Owners record each day's actual arrival and leaving times, a rating from 1 to 10, notes, and an optional bonus recommendation. Staff can read only their own profile and attendance; salaries and attendance are editable only by owners, and ratings, notes, and bonus recommendations are owner-only. Bonus markers support review; they do not change salaries or issue payments.
+Staff sign in and sign out from their own dashboard using server-recorded attendance times. Owners can correct arrival and leaving times and record a rating from 1 to 10, notes, and an optional bonus recommendation. Staff see only their attendance sign-in/sign-out block; profiles, salary details, attendance history, and attendance corrections are owner-only, and ratings, notes, and bonus recommendations are owner-only. Bonus markers support review; they do not change salaries or issue payments.
 
 `GET/PATCH /api/staff-profiles/` and `GET/POST/PATCH /api/staff-daily-records/` provide the data. Use `?start=YYYY-MM-DD&end=YYYY-MM-DD&staff=<user_id>` for daily history. Daily records are unique per staff member and day. The expected start time is saved with each daily record so later schedule changes do not rewrite historical lateness. Corrections to profiles and daily records are recorded in the owner's audit log.
 
@@ -103,4 +103,4 @@ Run `python manage.py migrate` before starting the updated API. Migration 0013 c
 
 Cash counts are owner/admin-only (`/api/cash-counts/`). Admin enters one combined cash and transfer total for the whole shop each day. No staff selection is required. The total is compared with all shop payments and photocopy collections before expenses. Staff cannot view or enter counts. Migration 0014 combines historical staff counts per day, preserving the original rows in an owner-only audit entry.
 
-The money statement's `received` value automatically sums payment records and photocopy collections recorded by all staff and admins for each day (Africa/Lagos). It works without a cash count. Manual shop counts are used for reconciliation; `remaining` is recorded collections minus expenses.
+The money statement's `received` value automatically sums payment records and photocopy collections recorded by all staff and admins for each day (Africa/Lagos). It works without a cash count. Manual shop counts are used for reconciliation; `remaining` is recorded collections minus only expenses marked `paid_from_takings=true`. Expenses paid from other funds remain included in expense totals and category reports, without reducing shop takings.

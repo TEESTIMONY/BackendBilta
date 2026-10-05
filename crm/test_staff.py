@@ -49,11 +49,10 @@ class StaffProfileTests(APITestCase):
         self.assertEqual(log.metadata['changes']['monthly_salary']['before'], '0.00')
         self.assertEqual(log.performed_by_id, self.owner.pk)
         self.assertEqual(self.owner_client.patch(url, {'monthly_salary': '-1'}, format='json').status_code, 400)
-        self.assertEqual(self.staff_client.get(url).data['monthly_salary'], '150000.00')
+        self.assertEqual(self.staff_client.get(url).status_code, 403)
         self.assertEqual(self.staff_client.patch(url, {'monthly_salary': '1'}, format='json').status_code, 403)
-        self.assertEqual(self.staff_client.get(f'/api/staff-profiles/{self.other.staff_profile.pk}/').status_code, 404)
-        listed = self.staff_client.get('/api/staff-profiles/').data
-        self.assertEqual(len(listed['results'] if isinstance(listed, dict) else listed), 1)
+        self.assertEqual(self.staff_client.get(f'/api/staff-profiles/{self.other.staff_profile.pk}/').status_code, 403)
+        self.assertEqual(self.staff_client.get('/api/staff-profiles/').status_code, 403)
 
     def test_attendance_rating_notes_bonus_and_privacy(self):
         result = self.owner_client.post('/api/staff-daily-records/', self.payload(), format='json')
@@ -62,17 +61,13 @@ class StaffProfileTests(APITestCase):
         self.assertEqual(result.data['worked_minutes'], 555)
         self.assertEqual(result.data['rating'], 9)
         url = f"/api/staff-daily-records/{result.data['id']}/"
-        read = self.staff_client.get(url)
-        self.assertEqual(read.status_code, 200)
-        self.assertEqual(read.data['resumed_at'], result.data['resumed_at'])
-        for private in ('rating', 'notes', 'bonus_recommended', 'recorded_by_name', 'updated_by_name'):
-            self.assertNotIn(private, read.data)
+        self.assertEqual(self.staff_client.get(url).status_code, 403)
         self.assertEqual(self.staff_client.post('/api/staff-daily-records/', self.payload(), format='json').status_code, 403)
         self.assertEqual(self.staff_client.patch(url, {'resumed_at': None, 'rating': 10}, format='json').status_code, 403)
         other_client = APIClient()
         other_client.force_authenticate(self.other)
-        self.assertEqual(other_client.get(url).status_code, 404)
-        self.assertEqual(other_client.get(f'/api/staff-daily-records/?staff={self.staff.id}').data['count'], 0)
+        self.assertEqual(other_client.get(url).status_code, 403)
+        self.assertEqual(other_client.get(f'/api/staff-daily-records/?staff={self.staff.id}').status_code, 403)
         self.assertEqual(APIClient().get('/api/staff-profiles/').status_code, 401)
         self.assertEqual(APIClient().get('/api/staff-daily-records/').status_code, 401)
 
@@ -136,3 +131,46 @@ class StaffProfileTests(APITestCase):
             request.user = self.owner
             self.assertTrue(model_admin.has_view_permission(request))
             self.assertTrue(model_admin.has_change_permission(request))
+
+    def test_staff_self_attendance_uses_server_time_and_preserves_private_review(self):
+        from unittest.mock import patch
+        day = timezone.localdate()
+        arrival = timezone.make_aware(datetime.combine(day, time(23, 50)))
+        leaving = arrival + timedelta(minutes=30)
+        record = StaffDailyRecord.objects.create(staff=self.staff, date=day, rating=8, notes='Private review', bonus_recommended=True)
+        root = '/api/staff-daily-records/'
+        self.assertEqual(self.staff_client.post(root + 'sign-out/', {}, format='json').status_code, 400)
+        self.assertEqual(self.staff_client.post(root + 'sign-in/', {'staff': self.other.pk, 'resumed_at': self.arrival.isoformat()}, format='json').status_code, 400)
+        with patch('django.utils.timezone.now', return_value=arrival):
+            result = self.staff_client.post(root + 'sign-in/', {}, format='json')
+            self.assertEqual(result.status_code, 200, result.data)
+            self.assertNotIn('notes', result.data)
+            self.assertNotIn('rating', result.data)
+            self.assertEqual(self.staff_client.post(root + 'sign-in/', {}, format='json').status_code, 400)
+        record.refresh_from_db()
+        self.assertEqual(record.resumed_at, arrival)
+        self.assertEqual(record.notes, 'Private review')
+        with patch('django.utils.timezone.now', return_value=leaving):
+            self.assertEqual(self.staff_client.get(root + 'attendance/').data['id'], record.pk)
+            result = self.staff_client.post(root + 'sign-out/', {}, format='json')
+            self.assertEqual(result.status_code, 200, result.data)
+            self.assertEqual(result.data['worked_minutes'], 30)
+        record.refresh_from_db()
+        self.assertEqual(record.left_at, leaving)
+        self.assertEqual(record.rating, 8)
+        self.assertTrue(record.bonus_recommended)
+        self.assertFalse(StaffDailyRecord.objects.filter(staff=self.other).exists())
+        self.assertEqual(AuditLog.objects.filter(model_name='StaffDailyRecord', action__in=['sign_in', 'sign_out'], performed_by=self.staff).count(), 2)
+        self.assertEqual(APIClient().post(root + 'sign-in/', {}, format='json').status_code, 401)
+
+    def test_staff_cannot_repeat_sign_out_or_change_saved_times(self):
+        root = '/api/staff-daily-records/'
+        self.assertEqual(self.staff_client.post(root + 'sign-in/', {}, format='json').status_code, 200)
+        self.assertEqual(self.staff_client.post(root + 'sign-out/', {}, format='json').status_code, 200)
+        record = StaffDailyRecord.objects.get(staff=self.staff)
+        original = record.left_at
+        self.assertEqual(self.staff_client.post(root + 'sign-out/', {}, format='json').status_code, 400)
+        self.assertEqual(self.staff_client.post(root + 'sign-in/', {}, format='json').status_code, 400)
+        self.assertEqual(self.staff_client.patch(f'{root}{record.pk}/', {'left_at': None}, format='json').status_code, 403)
+        record.refresh_from_db()
+        self.assertEqual(record.left_at, original)

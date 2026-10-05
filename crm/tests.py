@@ -1108,17 +1108,22 @@ class ApiSmokeTests(APITestCase):
         self.assertEqual(self.staff_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').status_code, 403)
         self.assertEqual(self.staff_client.delete(f"/api/expenses/{diesel.data['id']}/").status_code, 403)
 
-        # Statement: received = all recorded collections; remaining = received - expenses.
+        # Remaining deducts only expenses paid from takings; all expenses remain reported.
         statement = self.owner_client.get(f'/api/reports/statement/?start={yesterday}&end={today}').data
         days = {row['date']: row for row in statement['days']}
         self.assertEqual(days[str(today)]['received'], '3700.00')
         self.assertEqual(days[str(today)]['expenses'], '20500.00')
-        self.assertEqual(days[str(today)]['remaining'], '-16800.00')
+        self.assertEqual(days[str(today)]['remaining'], '3200.00')
         self.assertEqual(days[str(yesterday)]['received'], '0.00')
         self.assertEqual(days[str(yesterday)]['expenses'], '3000.00')
         self.assertEqual(statement['totals']['received'], '3700.00')
         self.assertEqual(statement['totals']['expenses'], '23500.00')
-        self.assertEqual(statement['totals']['remaining'], '-19800.00')
+        self.assertEqual(statement['totals']['remaining'], '3200.00')
+        self.assertEqual(days[str(yesterday)]['remaining'], '0.00')
+        self.assertEqual(days[str(today)]['expenses_from_takings'], '500.00')
+        self.assertEqual(days[str(today)]['expenses_from_other_funds'], '20000.00')
+        self.assertEqual(statement['totals']['expenses_from_takings'], '500.00')
+        self.assertEqual(statement['totals']['expenses_from_other_funds'], '23000.00')
         self.assertEqual(
             [(row['label'], row['total']) for row in statement['expenses_by_category']],
             [('Rent & bills', '20000.00'), ('Materials', '3000.00'), ('Fuel / diesel', '500.00')],

@@ -731,7 +731,8 @@ def money_statement(request):
         .annotate(cash=Sum('cash_amount'), transfer=Sum('transfer_amount'), entries=Count('id'))
     )
     expenses = Expense.objects.filter(date__range=(start, end))
-    spent = expenses.values('date').annotate(total=Sum('amount'))
+    spent = expenses.values('date').annotate(
+        total=Sum('amount'), from_takings=Sum('amount', filter=Q(paid_from_takings=True)))
     by_category = expenses.values('category').annotate(total=Sum('amount')).order_by('-total')
 
     # Received comes from all collectors' records, never from the manual cash count.
@@ -749,17 +750,20 @@ def money_statement(request):
     }
 
     counts_by_day = {row['date']: row for row in counts}
-    spent_by_day = {row['date']: row['total'] for row in spent}
+    spent_by_day = {row['date']: row for row in spent}
 
     days = []
-    totals = {'cash': zero, 'transfer': zero, 'received': zero, 'expenses': zero}
+    totals = {'cash': zero, 'transfer': zero, 'received': zero, 'expenses': zero, 'expenses_from_takings': zero, 'expenses_from_other_funds': zero}
     day = start
     while day <= end:
         count = counts_by_day.get(day, {})
         cash = count.get('cash') or zero
         transfer = count.get('transfer') or zero
         received = payments_by_day.get(day, zero) + copies_by_day.get(day, zero)
-        spent_today = spent_by_day.get(day) or zero
+        spending = spent_by_day.get(day, {})
+        spent_today = spending.get('total') or zero
+        from_takings = spending.get('from_takings') or zero
+        from_other_funds = spent_today - from_takings
         days.append({
             'date': str(day),
             'cash': money(cash),
@@ -767,9 +771,12 @@ def money_statement(request):
             'count_entered': bool(count),
             'received': money(received),
             'expenses': money(spent_today),
-            'remaining': money(received - spent_today),
+            'expenses_from_takings': money(from_takings),
+            'expenses_from_other_funds': money(from_other_funds),
+            'remaining': money(received - from_takings),
         })
-        for key, value in (('cash', cash), ('transfer', transfer), ('received', received), ('expenses', spent_today)):
+        for key, value in (('cash', cash), ('transfer', transfer), ('received', received), ('expenses', spent_today),
+                           ('expenses_from_takings', from_takings), ('expenses_from_other_funds', from_other_funds)):
             totals[key] += value
         day += timedelta(days=1)
 
@@ -779,7 +786,7 @@ def money_statement(request):
         'end': str(end),
         'days': days,
         'totals': {**{key: money(value) for key, value in totals.items()},
-                   'remaining': money(totals['received'] - totals['expenses'])},
+                   'remaining': money(totals['received'] - totals['expenses_from_takings'])},
         'expenses_by_category': [
             {'category': row['category'], 'label': labels.get(row['category'], row['category']), 'total': money(row['total'])}
             for row in by_category
